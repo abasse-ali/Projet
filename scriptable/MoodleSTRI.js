@@ -3,7 +3,7 @@
 // icon-color: deep-blue; icon-glyph: graduation-cap;
 //
 // ============================================================================
-//  Moodle STRI  ->  app Fichiers (iCloud Drive)
+//  Moodle STRI  ->  app Fichiers
 //  Télécharge le contenu d'un ou plusieurs cours Moodle (documents, vidéos,
 //  images, pages, liens externes) et le range dans Fichiers, section par
 //  section, en évitant de re-télécharger ce qui est déjà présent.
@@ -16,7 +16,13 @@
 //    3. "wv"  : connexion dans une WebView (indispensable si SSO / CAS),
 //               les téléchargements passent ensuite par la session du WebView
 //
-//  Voir README.md pour l'installation pas à pas.
+//  STOCKAGE — à lire une fois
+//  FileManager.local().documentsDirectory() est un conteneur INTERNE que l'app
+//  Fichiers n'affiche pas. Ce que Fichiers montre sous « Scriptable », c'est le
+//  File Provider. On écrit donc dans le signet « File Provider Storage »
+//  (Scriptable ▸ ⚙️ ▸ File Bookmarks), présent par défaut.
+//  Pour choisir un autre dossier : ⚙️ ▸ File Bookmarks ▸ + ▸ Pick Folder,
+//  puis reportez son nom dans CONFIG.bookmarkName.
 // ============================================================================
 
 const CONFIG = {
@@ -26,8 +32,9 @@ const CONFIG = {
   allMyCourses: false,      // true = tous les cours où je suis inscrit (mode ws)
 
   // --- Stockage ------------------------------------------------------------
-  rootFolderName: "Moodle STRI",  // dossier créé dans Scriptable (Fichiers)
-  useICloud: false,               // false = « Sur mon iPhone » ; true = iCloud Drive
+  rootFolderName: "Moodle STRI",
+  bookmarkName: "File Provider Storage", // signet Scriptable ; "" = conteneur interne (invisible dans Fichiers)
+  useICloud: false,               // false = local ; true = iCloud Drive
   overwrite: false,               // true = re-télécharge tout à chaque fois
   maxFileMB: 0,                   // 0 = pas de limite ; ex. 300 pour éviter les gros films
   maxFileMBWebView: 60,           // limite spécifique au mode WebView (pont JS)
@@ -184,7 +191,6 @@ async function safe(fn, fallback) {
 //  Système de fichiers + manifeste (pour ne pas re-télécharger)
 // ---------------------------------------------------------------------------
 const fm = (() => {
-  // Par défaut : stockage local, visible dans Fichiers ▸ Sur mon iPhone ▸ Scriptable.
   if (CONFIG.useICloud) {
     try {
       const f = FileManager.iCloud();
@@ -197,7 +203,34 @@ const fm = (() => {
   return FileManager.local();
 })();
 
-const ROOT = fm.joinPath(fm.documentsDirectory(), CONFIG.rootFolderName);
+/**
+ * Dossier racine.
+ *
+ * documentsDirectory() est un conteneur interne que l'app Fichiers n'affiche
+ * pas. On privilégie donc un signet (⚙️ ▸ File Bookmarks), en particulier
+ * « File Provider Storage » : c'est exactement ce que Fichiers montre sous
+ * Scriptable. Si le signet est absent, on retombe sur l'ancien comportement.
+ */
+const ROOT = (() => {
+  const name = String(CONFIG.bookmarkName || "").trim();
+  if (name) {
+    try {
+      const base = fm.bookmarkedPath(name);
+      if (base) return fm.joinPath(base, CONFIG.rootFolderName);
+    } catch (e) {
+      warn(
+        `Signet « ${name} » introuvable (Scriptable ▸ ⚙️ ▸ File Bookmarks) — ` +
+        "écriture dans le conteneur interne, invisible depuis Fichiers."
+      );
+    }
+  }
+  return fm.joinPath(fm.documentsDirectory(), CONFIG.rootFolderName);
+})();
+
+/** Ouvre un chemin dans l'app Fichiers. encodeURI : le chemin contient des espaces. */
+function openInFiles(path) {
+  Safari.open("shareddocuments://" + encodeURI(path));
+}
 
 function ensureDir(path) {
   if (!fm.fileExists(path)) fm.createDirectory(path, true);
@@ -368,33 +401,59 @@ const WebViewClient = {
   async run(url, wantBinary) {
     const cap = Math.max(1, CONFIG.maxFileMBWebView) * 1024 * 1024;
     const js = `
-      (async () => {
-        try {
-          const r = await fetch(${JSON.stringify(url)}, { credentials: "include", redirect: "follow" });
-          const ct = r.headers.get("content-type") || "";
-          const cd = r.headers.get("content-disposition") || "";
-          const textish = /^(text\\/|application\\/(json|javascript|xhtml))/i.test(ct);
-          if (textish || !${wantBinary ? "true" : "false"}) {
-            const t = await r.text();
-            completion({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, text: t });
-            return;
-          }
-          const b = await r.blob();
-          if (b.size > ${cap}) {
-            completion({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, size: b.size, tooLarge: true });
-            return;
-          }
-          const b64 = await new Promise((res, rej) => {
-            const fr = new FileReader();
-            fr.onload = () => res(String(fr.result).split(",")[1] || "");
-            fr.onerror = () => rej(fr.error);
-            fr.readAsDataURL(b);
-          });
-          completion({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, size: b.size, b64 });
-        } catch (e) {
-          completion({ ok: false, status: 0, error: String(e) });
+      (function () {
+        var TARGET = ${JSON.stringify(url)};
+        var CAP = ${cap};
+        var WANT_BINARY = ${wantBinary ? "true" : "false"};
+
+        var done = false;
+        function reply(payload) {
+          if (done) return;
+          done = true;
+          completion(payload);
         }
-      })();`;
+
+        // Filet de sécurité : jamais de blocage silencieux.
+        setTimeout(function () {
+          reply({ ok: false, status: 0, error: "timeout" });
+        }, 120000);
+
+        (async function () {
+          try {
+            const r = await fetch(TARGET, { credentials: "include", redirect: "follow" });
+            const ct = r.headers.get("content-type") || "";
+            const cd = r.headers.get("content-disposition") || "";
+            const textish = /^(text\\/|application\\/(json|javascript|xhtml))/i.test(ct);
+
+            if (textish || !WANT_BINARY) {
+              const t = await r.text();
+              reply({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, text: t });
+              return;
+            }
+
+            const b = await r.blob();
+            if (b.size > CAP) {
+              reply({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, size: b.size, tooLarge: true });
+              return;
+            }
+
+            const b64 = await new Promise(function (res, rej) {
+              const fr = new FileReader();
+              fr.onload = function () { res(String(fr.result).split(",")[1] || ""); };
+              fr.onerror = function () { rej(fr.error); };
+              fr.readAsDataURL(b);
+            });
+
+            reply({ ok: r.ok, status: r.status, url: r.url, contentType: ct, disposition: cd, size: b.size, b64: b64 });
+          } catch (e) {
+            reply({ ok: false, status: 0, error: String(e && e.message ? e.message : e) });
+          }
+        })();
+
+        // IMPORTANT : la fonction englobante ne retourne rien.
+        // WKWebView reçoit donc undefined, et non une Promise (type non supporté).
+      })();
+    `;
     return await this.wv.evaluateJavaScript(js, true);
   },
 
@@ -686,7 +745,9 @@ async function webViewLogin() {
 
   // On se replace sur le domaine Moodle : les fetch() suivants doivent être
   // « same-origin » (si la connexion se termine sur le portail SSO, CORS bloque).
+  // loadURL rend la main avant la fin du rendu : on laisse la page se poser.
   await safe(() => wv.loadURL(`${BASE}/my/`), null);
+  await sleep(1500);
   await WebViewClient.ensure(wv);
   const probe = await WebViewClient.run(`${BASE}/my/`, false);
   const html = String((probe && probe.text) || "");
@@ -901,7 +962,7 @@ async function syncCourseWS(token, courseId, courseName) {
 async function syncCourseHTML(client, courseId) {
   const res = await client.fetch(`${BASE}/course/view.php?id=${courseId}`);
   const html = String(res.text || "");
-  if (!html || /login\/index\.php/i.test(html) && /loginform|loginbtn/i.test(html)) {
+  if (!html || (/login\/index\.php/i.test(html) && /loginform|loginbtn/i.test(html))) {
     throw new Error(`Cours ${courseId} inaccessible (session perdue ou droits insuffisants).`);
   }
 
@@ -1225,7 +1286,7 @@ function summary(started) {
     `Liens externes       : ${stats.links}`,
     `Erreurs              : ${stats.errors.length}`,
     `Durée                : ${secs}s`,
-    `Dossier              : Fichiers ▸ ${CONFIG.useICloud ? "iCloud Drive" : "Sur mon iPhone"} ▸ Scriptable ▸ ${CONFIG.rootFolderName}`,
+    `Dossier              : ${ROOT}`,
   ];
   if (stats.errors.length) {
     lines.push("", "Détails des erreurs :");
@@ -1240,6 +1301,7 @@ async function main() {
   if (CONFIG.resetCredentials) forgetCredentials();
 
   ensureDir(ROOT);
+  log(`Destination : ${ROOT}`);
   await loadManifest();
 
   const auth = await connect();
@@ -1280,9 +1342,18 @@ async function main() {
     done.title = "Synchronisation terminée";
     done.message = text;
     done.addAction("Ouvrir le dossier");
+    done.addAction("Exporter vers Fichiers");
+    done.addAction("Copier le chemin");
     done.addCancelAction("Fermer");
-    if ((await done.presentAlert()) === 0) {
-      Safari.open(`shareddocuments://${ROOT}`);
+    const choice = await done.presentAlert();
+
+    if (choice === 0) {
+      openInFiles(ROOT);
+    } else if (choice === 1) {
+      // Filet de sécurité : copie le dossier là où l'utilisateur le souhaite.
+      await safe(() => DocumentPicker.export(ROOT), null);
+    } else if (choice === 2) {
+      Pasteboard.copy(ROOT);
     }
   }
   Script.setShortcutOutput(text);
