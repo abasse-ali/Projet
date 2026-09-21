@@ -27,7 +27,7 @@ const CONFIG = {
 
   // --- Stockage ------------------------------------------------------------
   rootFolderName: "Moodle STRI",  // dossier créé dans Scriptable (Fichiers)
-  useICloud: true,                // false = stockage local à l'app
+  useICloud: false,               // false = « Sur mon iPhone » ; true = iCloud Drive
   overwrite: false,               // true = re-télécharge tout à chaque fois
   maxFileMB: 0,                   // 0 = pas de limite ; ex. 300 pour éviter les gros films
   maxFileMBWebView: 60,           // limite spécifique au mode WebView (pont JS)
@@ -184,6 +184,7 @@ async function safe(fn, fallback) {
 //  Système de fichiers + manifeste (pour ne pas re-télécharger)
 // ---------------------------------------------------------------------------
 const fm = (() => {
+  // Par défaut : stockage local, visible dans Fichiers ▸ Sur mon iPhone ▸ Scriptable.
   if (CONFIG.useICloud) {
     try {
       const f = FileManager.iCloud();

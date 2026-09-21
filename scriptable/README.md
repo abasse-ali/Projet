@@ -15,8 +15,9 @@ taille et date de chaque fichier).
 2. Copier `MoodleSTRI.js` sur l'iPhone, au choix :
    - ouvrir le fichier sur GitHub → **Raw** → tout sélectionner → copier, puis dans Scriptable
      `+` (nouveau script) → coller ;
-   - ou déposer `MoodleSTRI.js` dans **Fichiers ▸ iCloud Drive ▸ Scriptable** : il apparaît
-     directement dans la liste des scripts.
+   - ou déposer `MoodleSTRI.js` dans le dossier **Scriptable** de l'app Fichiers
+     (**Sur mon iPhone ▸ Scriptable**, ou iCloud Drive selon le réglage *iCloud Sync* de
+     Scriptable) : il apparaît directement dans la liste des scripts.
 3. Renommer le script « Moodle STRI » (appui long → *Rename*).
 
 ## 2. Première exécution
@@ -45,8 +46,10 @@ puis remettre `false`.
 
 ## 3. Où arrivent les fichiers
 
+Stockage **local**, directement sur l'appareil (rien n'est envoyé sur iCloud) :
+
 ```
-Fichiers ▸ iCloud Drive ▸ Scriptable ▸ Moodle STRI
+Fichiers ▸ Sur mon iPhone ▸ Scriptable ▸ Moodle STRI
 └── 45 - Nom du cours
     ├── INDEX.md              (plan du cours + lien de chaque activité)
     ├── LIENS.md              (tous les liens externes du cours)
@@ -69,7 +72,7 @@ Fichiers ▸ iCloud Drive ▸ Scriptable ▸ Moodle STRI
 | `courseIds` | `[45]` | Cours à récupérer, ex. `[45, 52]` |
 | `allMyCourses` | `false` | `true` = tous les cours où tu es inscrit (mode API uniquement) |
 | `rootFolderName` | `Moodle STRI` | Dossier de destination dans Scriptable |
-| `useICloud` | `true` | `false` = stockage local (« Sur mon iPhone ») |
+| `useICloud` | `false` | `false` = « Sur mon iPhone » (défaut) ; `true` = iCloud Drive |
 | `overwrite` | `false` | `true` = tout re-télécharger |
 | `maxFileMB` | `0` | Ignorer les fichiers au-delà de N Mo (`0` = pas de limite) |
 | `maxFileMBWebView` | `60` | Limite propre au mode SSO/WebView (transfert via pont JS) |
@@ -103,6 +106,9 @@ Scriptable » avec le texte `45,52` remplace `courseIds`.
   l'activité est déposé dans `_activités/`.
 - **Erreurs réseau** : chaque requête est retentée 3 fois avec attente progressive ; le résumé
   final liste les échecs restants.
+- **Sauvegarde** : les fichiers étant stockés sur l'appareil, ils suivent les sauvegardes
+  iPhone (iCloud Backup / Finder) mais ne sont pas synchronisés entre appareils. Pour les
+  retrouver sur Mac/iPad, passer `useICloud: true`.
 - Le script ne récupère que ce à quoi **ton compte a déjà accès** : il ne contourne ni les
   clés d'inscription ni les restrictions d'accès. Les contenus restent soumis au droit d'auteur
   de leurs auteurs — usage personnel.
