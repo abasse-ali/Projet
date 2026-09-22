@@ -268,17 +268,37 @@ function saveManifest() {
   catch (e) { fail("Écriture du manifeste : " + e); }
 }
 
-/** Chemin libre : ajoute " (2)", " (3)"… si le nom est déjà pris par autre chose. */
+/** À quelle ressource appartient ce chemin, d'après le manifeste ? */
+function pathOwner(path) {
+  for (const k of Object.keys(manifest)) {
+    if (k === "__courses") continue;
+    const e = manifest[k];
+    if (e && e.path === path) return k;
+  }
+  return null;
+}
+
+/**
+ * Chemin de destination pour `key`, avec " (2)", " (3)"… seulement si le nom
+ * est déjà pris par une AUTRE ressource.
+ *
+ * L'ancienne version comparait au chemin mémorisé : après un renommage de
+ * dossier, tout le manifeste devenait obsolète et un doublon était créé à
+ * chaque exécution. Elle calculait de surcroît l'extension sur le nom déjà
+ * suffixé tout en découpant le nom d'origine, d'où « Séquence 0.pdf (3) ».
+ */
 function uniquePath(dir, filename, key) {
-  let name = filename;
+  const name = sanitize(filename, "fichier");
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+
   let path = fm.joinPath(dir, name);
   let n = 2;
-  while (fm.fileExists(path) && manifest[key] && manifest[key].path !== path) {
-    const dot = name.lastIndexOf(".");
-    const stem = dot > 0 ? filename.slice(0, dot) : filename;
-    const ext = dot > 0 ? filename.slice(dot) : "";
-    name = `${stem} (${n})${ext}`;
-    path = fm.joinPath(dir, name);
+  while (fm.fileExists(path)) {
+    const owner = pathOwner(path);
+    if (!owner || owner === key) break; // libre, ou déjà à nous
+    path = fm.joinPath(dir, `${stem} (${n})${ext}`);
     n++;
     if (n > 50) break;
   }
@@ -513,6 +533,33 @@ function filenameFromDisposition(disposition) {
 }
 
 const IMAGE_EXT = /\.(jpe?g|png|gif|heic|heif|webp|tiff?)$/i;
+
+/** Extension déduite du type MIME, quand l'URL n'en donne aucune. */
+function extForContentType(ct) {
+  const c = String(ct || "").toLowerCase();
+  if (c.indexOf("pdf") >= 0) return ".pdf";
+  if (c.indexOf("zip") >= 0) return ".zip";
+  if (c.indexOf("json") >= 0) return ".json";
+  if (c.indexOf("csv") >= 0) return ".csv";
+  if (c.indexOf("sql") >= 0) return ".sql";
+  if (c.indexOf("xml") >= 0) return ".xml";
+  if (c.indexOf("plain") >= 0) return ".txt";
+  return "";
+}
+
+/**
+ * La réponse est-elle une page web, ou le fichier lui-même ?
+ *
+ * Un .sql ou un .txt arrive en text/plain : res.text est rempli sans que ce
+ * soit une page. Sans ce test, le fichier n'était jamais enregistré et
+ * INDEX.md gardait le lien Moodle.
+ */
+function looksLikeWebPage(res) {
+  if (res.disposition && /attachment|filename/i.test(res.disposition)) return false;
+  if (/text\/html|application\/xhtml/i.test(String(res.contentType || ""))) return true;
+  if (res.text == null) return false;
+  return /<!doctype html|<html[\s>]/i.test(String(res.text).slice(0, 2000));
+}
 
 /**
  * Télécharge une URL vers `dir/filename`, en sautant ce qui est déjà à jour.
@@ -1045,7 +1092,10 @@ function htmlToMarkdown(html, opts) {
 
   s = s.replace(/<table[\s\S]*?<\/table>/gi, (t) => tableToMarkdown(t));
 
-  s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, c) => "\n\n```\n" + stripTags(c) + "\n```\n\n");
+  s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, c) => {
+    const t = stripTags(c);
+    return t ? "\n\n```\n" + t + "\n```\n\n" : "\n\n";
+  });
   s = s.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, c) => {
     const t = inlineText(c);
     return t ? "`" + t + "`" : "";
@@ -1148,14 +1198,26 @@ function renderIndexMarkdown(doc) {
 
     if (sec.summaryMd && sec.summaryMd.trim()) out.push(sec.summaryMd.trim(), "");
 
+    // Une ligne vide sépare toujours un bloc de texte d'une liste d'activités,
+    // sans quoi un titre collé à une puce n'est plus reconnu comme titre.
+    let lastWasBullet = false;
+    const blank = () => { if (out.length && out[out.length - 1] !== "") out.push(""); };
+
     for (const it of sec.items || []) {
       if (it.kind === "text") {
-        if (it.md && it.md.trim()) out.push(it.md.trim(), "");
+        if (!it.md || !it.md.trim()) continue;
+        blank();
+        out.push(it.md.trim(), "");
+        lastWasBullet = false;
         continue;
       }
+      if (!lastWasBullet) blank();
       out.push(renderItem(it));
       if (it.descMd && it.descMd.trim()) {
         out.push("", indentBlock(it.descMd.trim(), "  "), "");
+        lastWasBullet = false;
+      } else {
+        lastWasBullet = true;
       }
     }
     out.push("");
@@ -1664,19 +1726,34 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
   // 3. Cas général (ressource, dossier, devoir, glossaire…).
   const res = await client.fetch(mod.url);
 
-  // La page a directement renvoyé le fichier (redirection Moodle vers pluginfile).
-  if (!res.text && res.data) {
-    const nameFromHeader = filenameFromDisposition(res.disposition);
-    const fname = nameFromHeader || filenameFromUrl(res.finalUrl, modLabel);
+  // Moodle a servi le fichier lui-même — binaire, mais aussi texte (.sql, .txt…).
+  if (!looksLikeWebPage(res)) {
     const key = `${courseId}:${mod.id}:direct`;
-    const path = uniquePath(ensureDir(secDir), sanitize(fname, modLabel), key);
+
+    let fname = sanitize(filenameFromDisposition(res.disposition), "");
+    if (!fname) {
+      const fromUrl = filenameFromUrl(res.finalUrl, "");
+      if (fromUrl && /\.[a-z0-9]{1,8}$/i.test(fromUrl) && !/^view\.php/i.test(fromUrl)) {
+        fname = sanitize(fromUrl, "");
+      }
+    }
+    if (!fname) {
+      const ext = /\.[a-z0-9]{1,8}$/i.test(modLabel) ? "" : extForContentType(res.contentType);
+      fname = sanitize(modLabel + ext, modLabel);
+    }
+
+    let data = res.data;
+    if (!data && res.text != null) data = Data.fromString(res.text);
+    if (!data) return { files, target: mod.url };
+
+    const path = uniquePath(ensureDir(secDir), fname, key);
     if (!CONFIG.overwrite && fm.fileExists(path) && manifest[key]) {
       stats.skipped++;
       log(`      = ${fm.fileName(path, true)}`);
       remember(mod.url, path);
       return { files, target: mod.url };
     }
-    fm.write(path, res.data);
+    fm.write(path, data);
     const written = Math.round((fm.fileSize(path) || 0) * 1024);
     manifest[key] = { path, size: res.size || written, time: 0 };
     stats.files++;
