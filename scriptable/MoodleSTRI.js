@@ -12,7 +12,9 @@
 //
 //  AUTHENTIFICATION — connexion dans le navigateur, uniquement.
 //  Tu te connectes dans la fenêtre qui s'ouvre (SSO / CAS compris), puis le
-//  script travaille avec cette session. Si Moodle expose un jeton de service
+//  script travaille avec cette session. Le cours téléchargé est CELUI OUVERT
+//  dans la fenêtre au moment où tu la fermes : navigue jusqu'au cours voulu,
+//  puis ferme. Si Moodle expose un jeton de service
 //  web sur la page « Clés de sécurité », il est mémorisé et réutilisé aux
 //  lancements suivants : même authentification, sans avoir à se reconnecter.
 //
@@ -28,7 +30,8 @@
 const CONFIG = {
   // --- Site et cours -------------------------------------------------------
   baseUrl: "https://www.stri.fr/eformation",
-  courseIds: [45],          // ex. [45, 52, 61]
+  followBrowserCourse: true, // le cours ouvert dans le navigateur au moment de la fermeture
+  courseIds: [45],          // repli si aucun cours n'est détecté ; ex. [45, 52, 61]
   courseNames: {            // nom impose par cours : prioritaire sur la detection
     45: "Bases de données - Oracle",
   },
@@ -691,6 +694,50 @@ function looksLikeSso(finalUrl, html) {
   return /name="execution"|\/cas\/login|shibboleth|SAMLRequest|\/idp\//i.test(String(html || ""));
 }
 
+/**
+ * Quel cours est ouvert dans la WebView ?
+ *
+ * Lu au moment où l'utilisateur referme la fenêtre : c'est ainsi qu'il choisit
+ * le cours à télécharger. L'URL suffit sur une page de cours ; ailleurs
+ * (activité, devoir…) on se rabat sur M.cfg.courseId puis sur la classe
+ * « course-<id> » que Moodle pose sur <body>.
+ */
+async function detectCourseInWebView(wv) {
+  const js = `
+    (function () {
+      function reply(o) { completion(JSON.stringify(o)); }
+      try {
+        var href = String(location.href || "");
+        var id = 0;
+
+        var m = /\\/course\\/view\\.php\\?(?:[^#]*&)?id=(\\d+)/.exec(href);
+        if (m) id = Number(m[1]);
+        if (!id && window.M && M.cfg && M.cfg.courseId) id = Number(M.cfg.courseId);
+        if (!id && document.body) {
+          var b = /(?:^|\\s)course-(\\d+)(?:\\s|$)/.exec(document.body.className || "");
+          if (b) id = Number(b[1]);
+        }
+
+        var name = "";
+        var hdr = document.querySelector(".page-header-headings h1, #page-header h1");
+        if (hdr) name = String(hdr.textContent || "");
+        if (!name) name = String(document.title || "");
+
+        // id 1 = page d'accueil du site, ce n'est pas un cours.
+        reply({ id: id > 1 ? id : 0, name: name, url: href });
+      } catch (e) {
+        reply({ id: 0, name: "", url: "", error: String(e) });
+      }
+    })();
+  `;
+  const raw = await safe(() => wv.evaluateJavaScript(js, true), null);
+  if (!raw) return null;
+  let d = null;
+  try { d = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (e) { return null; }
+  if (!d || !d.id) return null;
+  return { id: Number(d.id), name: cleanCourseTitle(d.name || "") };
+}
+
 /** Connexion dans une WebView : seule solution fiable avec un SSO/CAS. */
 async function webViewLogin() {
   const wv = new WebView();
@@ -704,6 +751,15 @@ async function webViewLogin() {
   notice.addAction("Continuer");
   await notice.presentAlert();
   await wv.present(true);
+
+  // L'utilisateur a pu naviguer jusqu'au cours qui l'intéresse : on relève
+  // lequel AVANT de quitter la page pour revenir sur /my/.
+  const detected = await detectCourseInWebView(wv);
+  if (detected) {
+    log(`Cours ouvert à la fermeture : « ${detected.name || "sans nom"} » (id ${detected.id}).`);
+  } else {
+    warn("Aucun cours identifié dans le navigateur — repli sur CONFIG.courseIds.");
+  }
 
   // On se replace sur le domaine Moodle : les fetch() suivants doivent être
   // « same-origin » (si la connexion se termine sur le portail SSO, CORS bloque).
@@ -722,7 +778,7 @@ async function webViewLogin() {
       "ensuite ferme la fenêtre."
     );
   }
-  return wv;
+  return { wv, detected };
 }
 
 /** Tente de récupérer un jeton de service web depuis la page « Clés de sécurité ». */
@@ -1089,7 +1145,7 @@ async function syncCourseWS(token, courseId, courseName) {
 // ---------------------------------------------------------------------------
 //  Synchronisation — mode HTML (session web ou WebView)
 // ---------------------------------------------------------------------------
-async function syncCourseHTML(client, courseId) {
+async function syncCourseHTML(client, courseId, courseName) {
   const url = `${BASE}/course/view.php?id=${courseId}`;
   const res = await client.fetch(url);
 
@@ -1128,6 +1184,7 @@ async function syncCourseHTML(client, courseId) {
 
   const name =
     configuredCourseName(courseId) ||
+    cleanCourseTitle(courseName || "") ||
     courseNameFromHtml(html, courseId) ||
     `cours-${courseId}`;
   const courseDir = resolveCourseDir(courseId, name);
@@ -1338,16 +1395,17 @@ function resolveCourseIds() {
 
 /** Connexion par le navigateur : indispensable avec un SSO / CAS. */
 async function connectViaWebView() {
-  const wv = await webViewLogin();
+  const session = await webViewLogin();
+  const detected = session.detected;
   log("✓ Session ouverte dans la WebView.");
   // Bonus : si la page « Clés de sécurité » expose un jeton, on passe en mode API.
   const t = await safe(() => tokenFromManageTokenPage(WebViewClient), null);
   if (t && (await validateToken(t))) {
     Keychain.set(KC.token, t);
     log("✓ Jeton de service web récupéré : mode API activé (plus rapide).");
-    return { mode: "ws", token: t, client: NetClient };
+    return { mode: "ws", token: t, client: NetClient, detected };
   }
-  return { mode: "wv", token: null, client: WebViewClient, wv };
+  return { mode: "wv", token: null, client: WebViewClient, wv: session.wv, detected };
 }
 
 /**
@@ -1358,7 +1416,10 @@ async function connectViaWebView() {
  * Mets CONFIG.reuseToken à false pour repasser par le navigateur à chaque fois.
  */
 async function connect() {
-  if (CONFIG.reuseToken && Keychain.contains(KC.token)) {
+  // Le navigateur sert aussi à choisir le cours : quand followBrowserCourse est
+  // actif, on l'ouvre même si un jeton valide est mémorisé. La session y est
+  // déjà ouverte, il n'y a donc rien à ressaisir.
+  if (CONFIG.reuseToken && !CONFIG.followBrowserCourse && Keychain.contains(KC.token)) {
     const token = Keychain.get(KC.token);
     const info = await validateToken(token);
     if (info) {
@@ -1422,7 +1483,11 @@ async function main() {
   const auth = await connect();
   let targets = resolveCourseIds().map((id) => ({ id, name: null }));
 
-  if (auth.mode === "ws" && CONFIG.allMyCourses) {
+  const picked = auth.detected;
+  if (CONFIG.followBrowserCourse && picked && picked.id) {
+    targets = [{ id: picked.id, name: picked.name || null }];
+    log(`Cours retenu : « ${picked.name || "id " + picked.id} » (id ${picked.id}).`);
+  } else if (auth.mode === "ws" && CONFIG.allMyCourses) {
     const mine = await listMyCoursesWS(auth.token, auth.info);
     if (mine.length) targets = mine;
   }
@@ -1433,7 +1498,7 @@ async function main() {
   for (const t of targets) {
     try {
       if (auth.mode === "ws") await syncCourseWS(auth.token, t.id, t.name);
-      else await syncCourseHTML(auth.client, t.id);
+      else await syncCourseHTML(auth.client, t.id, t.name);
     } catch (e) {
       fail(`Cours ${t.id} : ${e && e.message ? e.message : e}`);
     }
