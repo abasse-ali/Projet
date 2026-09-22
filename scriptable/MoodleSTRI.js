@@ -628,7 +628,7 @@ function writeLink(dir, name, url, collector) {
 
 /** Enregistre une page Moodle (contenu principal) en HTML autonome. */
 function savePage(dir, name, html, sourceUrl) {
-  if (!CONFIG.savePages) return;
+  if (!CONFIG.savePages) return null;
   const label = sanitize(name, "page");
   const body = extractMainContent(html);
   const doc =
@@ -641,12 +641,15 @@ function savePage(dir, name, html, sourceUrl) {
     `<hr><p style="color:#777;font-size:.85em">Source : <a href="${escapeXml(sourceUrl || "")}">` +
     `${escapeXml(sourceUrl || "")}</a></p>\n</body>\n</html>\n`;
   try {
-    fm.writeString(fm.joinPath(ensureDir(dir), label + ".html"), doc);
+    const path = fm.joinPath(ensureDir(dir), label + ".html");
+    fm.writeString(path, doc);
     stats.pages++;
     log(`      ✎ ${label}.html`);
+    return path;
   } catch (e) {
     fail(`Page « ${label} » : ${e}`);
   }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +845,82 @@ function extractEmbeds(html, baseUrl) {
   return out;
 }
 
-/** Découpe la page de cours en sections + activités. */
+/**
+ * Blocs d'activité d'une section, dans l'ordre de la page.
+ *
+ * Moodle enveloppe chaque activité dans un <li id="module-123" class="… modtype_x">.
+ * Ce découpage donne aussi les « étiquettes » (modtype_label), qui portent les
+ * paragraphes affichés directement sur la page du cours.
+ */
+function parseActivityBlocks(sectionHtml) {
+  const src = String(sectionHtml || "");
+  const marks = [];
+  const re = /id="module-(\d+)"/gi;
+  let m;
+  while ((m = re.exec(src))) {
+    // id="module-123" se trouve APRÈS l'attribut class dans la balise : on
+    // remonte à l'ouverture du tag, sinon le bloc perd sa propre classe
+    // modtype_ et hérite de celle de l'activité suivante.
+    const open = src.lastIndexOf("<", m.index);
+    marks.push({ id: m[1], at: open >= 0 ? open : m.index });
+  }
+
+  const items = [];
+  const seen = {};
+
+  if (marks.length) {
+    for (let i = 0; i < marks.length; i++) {
+      const id = marks[i].id;
+      if (seen[id]) continue;
+      seen[id] = true;
+
+      const end = i + 1 < marks.length ? marks[i + 1].at : src.length;
+      const block = src.slice(marks[i].at, end);
+
+      const a = /<a[^>]+href="([^"]*\/mod\/([a-z0-9_]+)\/view\.php\?id=\d+[^"]*)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
+      const cls = /class="[^"]*modtype_([a-z0-9_]+)/i.exec(block);
+      const modname = (cls && cls[1]) || (a ? a[2] : "label");
+
+      let name = "";
+      if (a) {
+        let label = a[3].replace(/<span[^>]*class="[^"]*accesshide[^"]*"[^>]*>[\s\S]*?<\/span>/gi, "");
+        const inst = /class="[^"]*instancename[^"]*"[^>]*>([\s\S]*?)<\/span>/i.exec(label);
+        if (inst) label = inst[1];
+        name = stripTags(label);
+      }
+
+      // Description affichée sous l'activité — pour une étiquette, c'est tout son contenu.
+      let descHtml = "";
+      const d =
+        /<div[^>]+class="[^"]*\bcontentafterlink\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(block) ||
+        /<div[^>]+class="[^"]*\bactivity-altcontent\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(block) ||
+        /<div[^>]+class="[^"]*\bno-overflow\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(block);
+      if (d) descHtml = d[1];
+      if (!descHtml && !a) descHtml = block;
+
+      items.push({ id, modname, name, url: a ? absolutize(a[1], BASE) : "", descHtml });
+    }
+    return items;
+  }
+
+  // Thèmes anciens, sans id="module-…" : on retombe sur les liens d'activité.
+  const aRe = /<a[^>]+href="([^"]*\/mod\/([a-z0-9_]+)\/view\.php\?id=(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let a;
+  while ((a = aRe.exec(src))) {
+    const id = a[3];
+    if (seen[id]) continue;
+    let label = a[4].replace(/<span[^>]*class="[^"]*accesshide[^"]*"[^>]*>[\s\S]*?<\/span>/gi, "");
+    const inst = /class="[^"]*instancename[^"]*"[^>]*>([\s\S]*?)<\/span>/i.exec(label);
+    if (inst) label = inst[1];
+    label = stripTags(label);
+    if (!label) continue;
+    seen[id] = true;
+    items.push({ id, modname: a[2], name: label, url: absolutize(a[1], BASE), descHtml: "" });
+  }
+  return items;
+}
+
+/** Découpe la page de cours en sections (nom, résumé, activités). */
 function parseCourseHtml(html) {
   const src = String(html || "");
   const marks = [];
@@ -852,48 +930,253 @@ function parseCourseHtml(html) {
 
   const chunks = [];
   if (!marks.length) {
-    chunks.push({ index: 0, name: "", html: src });
+    chunks.push({ index: 0, html: src });
   } else {
     for (let i = 0; i < marks.length; i++) {
-      const start = marks[i].at;
       const end = i + 1 < marks.length ? marks[i + 1].at : src.length;
-      chunks.push({ index: marks[i].index, name: "", html: src.slice(start, end) });
+      chunks.push({ index: marks[i].index, html: src.slice(marks[i].at, end) });
     }
   }
 
   const sections = [];
   for (const c of chunks) {
     let name = "";
-    let h = /<h3[^>]*class="[^"]*sectionname[^"]*"[^>]*>([\s\S]*?)<\/h3>/i.exec(c.html) ||
-            /<h3[^>]*>([\s\S]*?)<\/h3>/i.exec(c.html);
+    const h =
+      /<h3[^>]*class="[^"]*sectionname[^"]*"[^>]*>([\s\S]*?)<\/h3>/i.exec(c.html) ||
+      /<h3[^>]*>([\s\S]*?)<\/h3>/i.exec(c.html);
     if (h) name = stripTags(h[1]);
     if (!name) {
       const al = /aria-label="([^"]+)"/i.exec(c.html);
       if (al) name = decodeEntities(al[1]);
     }
-    const modules = [];
-    const seen = {};
-    const aRe = /<a[^>]+href="([^"]*\/mod\/([a-z0-9_]+)\/view\.php\?id=(\d+)[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
-    let a;
-    while ((a = aRe.exec(c.html))) {
-      const id = a[3];
-      if (seen[id]) continue;
-      // On retire d'abord les libellés « accesshide » (« Fichier », « URL »…)
-      // sinon ils se retrouvent collés au nom de l'activité.
-      let label = a[4].replace(/<span[^>]*class="[^"]*accesshide[^"]*"[^>]*>[\s\S]*?<\/span>/gi, "");
-      const inst = /class="[^"]*instancename[^"]*"[^>]*>([\s\S]*?)<\/span>/i.exec(label);
-      if (inst) label = inst[1];
-      label = stripTags(label);
-      if (!label) continue;
-      seen[id] = true;
-      modules.push({ id, modname: a[2], name: label, url: absolutize(a[1], BASE) });
-    }
+
+    let summaryHtml = "";
+    const sm =
+      /<div[^>]+class="[^"]*\bsummarytext\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(c.html) ||
+      /<div[^>]+class="[^"]*\bsummary\b[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(c.html);
+    if (sm) summaryHtml = sm[1];
+
+    const items = parseActivityBlocks(c.html);
     const inlineFiles = extractPluginfileUrls(c.html, BASE);
-    if (modules.length || inlineFiles.length || name) {
-      sections.push({ index: c.index, name, modules, inlineFiles, html: c.html });
+    if (items.length || inlineFiles.length || name || summaryHtml) {
+      sections.push({ index: c.index, name, summaryHtml, items, inlineFiles, html: c.html });
     }
   }
   return sections;
+}
+
+// ---------------------------------------------------------------------------
+//  Conversion HTML -> Markdown (pour INDEX.md)
+// ---------------------------------------------------------------------------
+
+/** Chemin de `path` relatif à `fromDir`, pour des liens qui marchent en local. */
+function relPath(fromDir, path) {
+  const base = String(fromDir || "").replace(/\/+$/, "") + "/";
+  const p = String(path || "");
+  return p.indexOf(base) === 0 ? p.slice(base.length) : p;
+}
+
+function baseName(p) {
+  const parts = String(p || "").split("/");
+  return parts[parts.length - 1] || String(p || "");
+}
+
+/**
+ * Lien Markdown.
+ *
+ * Les espaces et parenthèses sont encodés plutôt que protégés par des
+ * chevrons : `<mon chemin>` serait pris pour une balise et supprimé par le
+ * nettoyage final de htmlToMarkdown, ce qui viderait le lien.
+ */
+function mdLink(label, url) {
+  const lab = String(label == null ? "" : label).replace(/[\[\]]/g, "").trim() || "(sans titre)";
+  let u = String(url == null ? "" : url);
+  if (!u) return lab;
+  u = u.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
+  return `[${lab}](${u})`;
+}
+
+/** Texte d'un fragment inline, balises retirées. */
+function inlineText(html) {
+  return stripTags(html).replace(/\s+/g, " ").trim();
+}
+
+function tableToMarkdown(tableHtml) {
+  const rows = [];
+  const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let m;
+  while ((m = trRe.exec(String(tableHtml)))) {
+    const cells = [];
+    const cRe = /<(t[hd])[^>]*>([\s\S]*?)<\/\1>/gi;
+    let c;
+    while ((c = cRe.exec(m[1]))) cells.push(inlineText(c[2]).replace(/\|/g, "\\|"));
+    if (cells.length) rows.push(cells);
+  }
+  if (!rows.length) return "";
+  const head = rows[0];
+  const out = ["", "| " + head.join(" | ") + " |", "| " + head.map(() => "---").join(" | ") + " |"];
+  for (let i = 1; i < rows.length; i++) out.push("| " + rows[i].join(" | ") + " |");
+  out.push("");
+  return out.join("\n");
+}
+
+/**
+ * Convertit du HTML Moodle en Markdown lisible.
+ *
+ * opts.resolve(href) remplace une URL par le chemin local du fichier déjà
+ * téléchargé ; opts.minLevel fixe le niveau de titre le moins profond autorisé,
+ * pour que le contenu s'emboîte sous les ## des sections sans tomber en ######.
+ */
+function htmlToMarkdown(html, opts) {
+  const o = opts || {};
+  const resolve = typeof o.resolve === "function" ? o.resolve : (u) => absolutize(u, BASE);
+  const minLevel = o.minLevel || 1;
+  let s = String(html == null ? "" : html);
+
+  s = s.replace(/<!--[\s\S]*?-->/g, " ");
+  s = s.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ");
+
+  // Habillage Moodle sans intérêt dans une copie de lecture.
+  s = s.replace(/<span[^>]+class="[^"]*\baccesshide\b[^"]*"[^>]*>[\s\S]*?<\/span>/gi, " ");
+  s = s.replace(
+    /<div[^>]+class="[^"]*\b(?:action-menu|actions|activity-badges|editing_|commands|availabilityinfo|completion)\b[^"]*"[^>]*>[\s\S]*?<\/div>/gi,
+    " "
+  );
+
+  s = s.replace(/<table[\s\S]*?<\/table>/gi, (t) => tableToMarkdown(t));
+
+  s = s.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, c) => "\n\n```\n" + stripTags(c) + "\n```\n\n");
+  s = s.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, c) => {
+    const t = inlineText(c);
+    return t ? "`" + t + "`" : "";
+  });
+
+  s = s.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, c) => {
+    const txt = inlineText(c);
+    if (!txt) return "\n\n";
+    const level = Math.min(6, Math.max(minLevel, Number(n)));
+    return "\n\n" + "#".repeat(level) + " " + txt + "\n\n";
+  });
+
+  s = s.replace(/<img[^>]*>/gi, (tag) => {
+    const src = (/src\s*=\s*["']([^"']+)["']/i.exec(tag) || [])[1] || "";
+    const alt = (/alt\s*=\s*["']([^"']*)["']/i.exec(tag) || [])[1] || "";
+    const url = src ? resolve(src) : "";
+    if (!url) return "";
+    const safeUrl = url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
+    return `![${decodeEntities(alt)}](${safeUrl})`;
+  });
+
+  s = s.replace(/<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, body) => {
+    const label = inlineText(body);
+    if (!label) return "";
+    const url = resolve(href);
+    return url ? mdLink(label, url) : label;
+  });
+
+  s = s.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, c) => {
+    const t = inlineText(c);
+    return t ? "**" + t + "**" : "";
+  });
+  s = s.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, c) => {
+    const t = inlineText(c);
+    return t ? "*" + t + "*" : "";
+  });
+
+  s = s.replace(/<li[^>]*>/gi, "\n- ").replace(/<\/li>/gi, "");
+  s = s.replace(/<\/?(ul|ol)[^>]*>/gi, "\n");
+
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<hr\s*\/?>/gi, "\n\n---\n\n");
+  s = s.replace(/<\/(p|div|section|article|tr|blockquote)>/gi, "\n\n");
+  s = s.replace(/<[^>]+>/g, "");
+
+  s = decodeEntities(s);
+  s = s.replace(/\r/g, "");
+  s = s.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n");
+  s = s.replace(/\n{3,}/g, "\n\n");
+  return s.trim();
+}
+
+// ---------------------------------------------------------------------------
+//  INDEX.md : copie Markdown de la page du cours
+// ---------------------------------------------------------------------------
+const ITEM_ICONS = {
+  resource: "📄", folder: "📁", url: "🔗", page: "📝", book: "📖",
+  assign: "📌", quiz: "❓", forum: "💬", label: "",
+};
+
+function itemIcon(modname) {
+  const i = ITEM_ICONS[String(modname || "")];
+  return i === undefined ? "•" : i;
+}
+
+function indentBlock(md, pad) {
+  return String(md)
+    .split("\n")
+    .map((l) => (l.trim() ? pad + l : ""))
+    .join("\n");
+}
+
+function renderItem(it) {
+  const icon = itemIcon(it.modname);
+  const head = icon ? icon + " " : "";
+  const files = it.files || [];
+
+  if (files.length === 1) return `- ${head}${mdLink(it.label, files[0])}`;
+  if (files.length > 1) {
+    const lines = [`- ${head}**${it.label}**`];
+    for (const f of files) lines.push(`    - ${mdLink(baseName(f), f)}`);
+    return lines.join("\n");
+  }
+  if (it.url) return `- ${head}${mdLink(it.label, it.url)}`;
+  return `- ${head}${it.label}`;
+}
+
+/** Assemble le document final. */
+function renderIndexMarkdown(doc) {
+  const out = [`# ${doc.title}`, ""];
+  out.push(`*Copie locale de <${doc.sourceUrl}> — ${doc.date}*`, "");
+
+  for (const sec of doc.sections || []) {
+    const hasContent =
+      (sec.summaryMd && sec.summaryMd.trim()) || (sec.items && sec.items.length);
+    if (!hasContent && !sec.name) continue;
+
+    out.push("---", "");
+    out.push(`## ${sec.name || "Section"}`, "");
+
+    if (sec.summaryMd && sec.summaryMd.trim()) out.push(sec.summaryMd.trim(), "");
+
+    for (const it of sec.items || []) {
+      if (it.kind === "text") {
+        if (it.md && it.md.trim()) out.push(it.md.trim(), "");
+        continue;
+      }
+      out.push(renderItem(it));
+      if (it.descMd && it.descMd.trim()) {
+        out.push("", indentBlock(it.descMd.trim(), "  "), "");
+      }
+    }
+    out.push("");
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+/** Remplace une URL par le chemin local du fichier téléchargé, s'il existe. */
+function makeResolver(courseDir, localByUrl) {
+  return (href) => {
+    const abs = absolutize(href, BASE);
+    const local = localByUrl[abs];
+    return local ? relPath(courseDir, local) : abs;
+  };
+}
+
+function todayStamp() {
+  const d = new Date();
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()} ` +
+         `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1353,32 @@ async function courseNameWS(token, courseId) {
   return `cours-${courseId}`;
 }
 
+/** Transforme les sections collectées en document Markdown prêt à rendre. */
+function buildIndexDoc(title, sourceUrl, courseDir, localByUrl, rawSections) {
+  const resolve = makeResolver(courseDir, localByUrl);
+  return {
+    title,
+    sourceUrl,
+    date: todayStamp(),
+    sections: rawSections.map((sec) => ({
+      name: sec.name,
+      summaryMd: htmlToMarkdown(sec.summaryHtml, { resolve, minLevel: 3 }),
+      items: (sec.items || []).map((it) =>
+        it.kind === "text"
+          ? { kind: "text", md: htmlToMarkdown(it.html, { resolve, minLevel: 3 }) }
+          : {
+              kind: "item",
+              modname: it.modname,
+              label: it.label,
+              url: it.url,
+              files: (it.files || []).map((f) => relPath(courseDir, f)),
+              descMd: htmlToMarkdown(it.html, { resolve, minLevel: 4 }),
+            }
+      ),
+    })),
+  };
+}
+
 async function syncCourseWS(token, courseId, courseName) {
   let name = configuredCourseName(courseId) || cleanCourseTitle(courseName || "");
   if (!isUsableCourseName(name)) name = await courseNameWS(token, courseId);
@@ -1080,15 +1389,20 @@ async function syncCourseWS(token, courseId, courseName) {
   if (!Array.isArray(sections)) throw new Error("Contenu du cours illisible.");
 
   const links = [];
-  const index = [`# ${name}`, "", `Source : ${BASE}/course/view.php?id=${courseId}`, ""];
+  const localByUrl = {};
+  const rawSections = [];
 
   for (let s = 0; s < sections.length; s++) {
     const sec = sections[s];
     const num = typeof sec.section === "number" ? sec.section : s;
-    const secName = sanitize(`${pad2(num)} - ${stripTags(sec.name) || "Section"}`, `section-${num}`);
-    const secDir = fm.joinPath(courseDir, secName);
-    log(`  📂 ${secName}`);
-    index.push(`\n## ${stripTags(sec.name) || `Section ${num}`}`);
+    const secLabel = stripTags(sec.name) || `Section ${num}`;
+    const secDir = fm.joinPath(
+      courseDir,
+      sanitize(`${pad2(num)} - ${secLabel}`, `section-${num}`)
+    );
+    log(`  📂 ${secLabel}`);
+
+    const docSec = { name: secLabel, summaryHtml: sec.summary || "", items: [] };
 
     const modules = Array.isArray(sec.modules) ? sec.modules : [];
     for (const mod of modules) {
@@ -1097,49 +1411,74 @@ async function syncCourseWS(token, courseId, courseName) {
       const files = contents.filter((c) => c.type === "file" && c.fileurl);
       const urls = contents.filter((c) => c.type === "url" && c.fileurl);
 
-      index.push(`- **${modName}** _(${mod.modname})_${mod.url ? ` — ${mod.url}` : ""}`);
+      // Une étiquette n'est qu'un bloc de texte sur la page du cours.
+      if (mod.modname === "label") {
+        docSec.items.push({ kind: "text", html: mod.description || "" });
+        continue;
+      }
 
-      if (mod.modname === "label") continue;
-
-      // Liens externes (mod/url, ou ressources de type lien)
       for (const u of urls) {
         writeLink(secDir, modName, u.fileurl, links);
         log(`      ↗︎ ${modName}`);
       }
 
-      if (!files.length) {
-        // Pas de fichier exposé : on garde au moins le lien vers l'activité.
-        if (mod.url && !urls.length && mod.modname !== "url") {
-          writeLink(fm.joinPath(secDir, "_activités"), modName, mod.url, null);
+      const savedPaths = [];
+
+      if (files.length) {
+        const multi = files.length > 1;
+        const targetDir = multi
+          ? fm.joinPath(secDir, sanitize(modName, `module-${mod.id}`))
+          : secDir;
+
+        for (const f of files) {
+          const sub = String(f.filepath || "/").replace(/^\/+|\/+$/g, "");
+          const dir = sub
+            ? fm.joinPath(targetDir, sanitize(sub.replace(/\//g, " - "), ""))
+            : targetDir;
+          let fname = f.filename || filenameFromUrl(f.fileurl, modName);
+          if (!multi && /^index\.html?$/i.test(fname)) fname = `${sanitize(modName, "page")}.html`;
+          else if (!multi && files.length === 1 && fname && !/\./.test(fname)) {
+            fname = sanitize(modName, fname);
+          }
+          const url = withParams(f.fileurl, { token, forcedownload: 1 });
+          const saved = await safe(
+            () =>
+              saveFile(NetClient, dir, fname, url, {
+                key: `${courseId}:${mod.id}:${f.filepath || "/"}${f.filename || fname}`,
+                size: Number(f.filesize || 0),
+                time: Number(f.timemodified || 0),
+              }),
+            null
+          );
+          if (saved) {
+            savedPaths.push(saved);
+            localByUrl[absolutize(f.fileurl, BASE)] = saved;
+          }
         }
-        continue;
+      } else if (mod.url && !urls.length && mod.modname !== "url") {
+        // Pas de fichier exposé : on garde au moins le lien vers l'activité.
+        writeLink(fm.joinPath(secDir, "_activités"), modName, mod.url, null);
       }
 
-      // Un module à plusieurs fichiers (dossier, page avec images) => sous-dossier
-      const multi = files.length > 1;
-      const targetDir = multi ? fm.joinPath(secDir, sanitize(modName, `module-${mod.id}`)) : secDir;
-
-      for (const f of files) {
-        const sub = String(f.filepath || "/").replace(/^\/+|\/+$/g, "");
-        const dir = sub ? fm.joinPath(targetDir, sanitize(sub.replace(/\//g, " - "), "")) : targetDir;
-        let fname = f.filename || filenameFromUrl(f.fileurl, modName);
-        if (!multi && /^index\.html?$/i.test(fname)) fname = `${sanitize(modName, "page")}.html`;
-        else if (!multi && files.length === 1 && fname && !/\./.test(fname)) fname = sanitize(modName, fname);
-        const url = withParams(f.fileurl, { token, forcedownload: 1 });
-        await safe(
-          () =>
-            saveFile(NetClient, dir, fname, url, {
-              key: `${courseId}:${mod.id}:${f.filepath || "/"}${f.filename || fname}`,
-              size: Number(f.filesize || 0),
-              time: Number(f.timemodified || 0),
-            }),
-          null
-        );
-      }
+      docSec.items.push({
+        kind: "item",
+        modname: mod.modname,
+        label: modName,
+        url: urls.length ? urls[0].fileurl : mod.url || "",
+        files: savedPaths,
+        html: mod.description || "",
+      });
     }
+
+    rawSections.push(docSec);
   }
 
-  finishCourse(courseDir, name, links, index);
+  finishCourse(
+    courseDir,
+    name,
+    links,
+    buildIndexDoc(name, `${BASE}/course/view.php?id=${courseId}`, courseDir, localByUrl, rawSections)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,8 +1502,6 @@ async function syncCourseHTML(client, courseId, courseName) {
     );
   }
 
-  // Preuve POSITIVE d'une session ouverte, plutôt que des mots-clés de login
-  // qui sont présents un peu partout dans le HTML de Moodle.
   if (!isLoggedInHtml(html)) {
     const t = /<title>([\s\S]*?)<\/title>/i.exec(html);
     const titre = stripTags(t ? t[1] : "") || "sans titre";
@@ -1177,7 +1514,6 @@ async function syncCourseHTML(client, courseId, courseName) {
     );
   }
 
-  // Connecté, mais pas inscrit à ce cours.
   if (/\/enrol\/index\.php/i.test(String(res.finalUrl || "")) || /id="page-enrol-index"/i.test(html)) {
     throw new Error(`Cours ${courseId} : inscription requise — ce compte n'y est pas inscrit.`);
   }
@@ -1192,36 +1528,76 @@ async function syncCourseHTML(client, courseId, courseName) {
 
   const sections = parseCourseHtml(html);
   const links = [];
-  const index = [`# ${name}`, "", `Source : ${BASE}/course/view.php?id=${courseId}`, ""];
+  const localByUrl = {};
+  const rawSections = [];
 
-  for (let s = 0; s < sections.length; s++) {
-    const sec = sections[s];
+  for (const sec of sections) {
     const secLabel = sec.name || `Section ${sec.index}`;
-    const secDir = fm.joinPath(courseDir, sanitize(`${pad2(sec.index)} - ${secLabel}`, `section-${sec.index}`));
+    const secDir = fm.joinPath(
+      courseDir,
+      sanitize(`${pad2(sec.index)} - ${secLabel}`, `section-${sec.index}`)
+    );
     log(`  📂 ${secLabel}`);
-    index.push(`\n## ${secLabel}`);
+
+    const docSec = { name: secLabel, summaryHtml: sec.summaryHtml || "", items: [] };
 
     for (const f of sec.inlineFiles) {
-      await safe(
+      const saved = await safe(
         () =>
           saveFile(client, secDir, filenameFromUrl(f, "fichier"), f, {
             key: `${courseId}:inline:${f}`,
           }),
         null
       );
+      if (saved) localByUrl[f] = saved;
     }
 
-    for (const mod of sec.modules) {
-      index.push(`- **${mod.name}** _(${mod.modname})_ — ${mod.url}`);
-      await safe(() => handleModuleHTML(client, mod, secDir, courseId, links), null);
+    for (const mod of sec.items) {
+      // Étiquette : du texte, pas une activité à télécharger.
+      if (!mod.url) {
+        docSec.items.push({ kind: "text", html: mod.descHtml || "" });
+        continue;
+      }
+
+      const outcome =
+        (await safe(
+          () => handleModuleHTML(client, mod, secDir, courseId, links, localByUrl),
+          null
+        )) || {};
+
+      docSec.items.push({
+        kind: "item",
+        modname: mod.modname,
+        label: mod.name || mod.modname,
+        url: outcome.target || mod.url,
+        files: outcome.files || [],
+        html: mod.descHtml || "",
+      });
     }
+
+    rawSections.push(docSec);
   }
 
-  finishCourse(courseDir, name, links, index);
+  finishCourse(
+    courseDir,
+    name,
+    links,
+    buildIndexDoc(name, url, courseDir, localByUrl, rawSections)
+  );
 }
 
-async function handleModuleHTML(client, mod, secDir, courseId, links) {
+/**
+ * Traite une activité. Retourne { files: [chemins locaux], target: URL retenue }
+ * pour que INDEX.md pointe vers le fichier téléchargé quand il existe.
+ */
+async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl) {
   const modLabel = mod.name || mod.modname;
+  const files = [];
+  const remember = (remoteUrl, path) => {
+    if (!path) return;
+    files.push(path);
+    if (remoteUrl) localByUrl[absolutize(remoteUrl, BASE)] = path;
+  };
 
   // 1. Liens externes : on demande à Moodle de ne pas rediriger.
   if (mod.modname === "url") {
@@ -1229,8 +1605,9 @@ async function handleModuleHTML(client, mod, secDir, courseId, links) {
     const page = await safe(() => client.fetch(withParams(mod.url, { redirect: 0 })), null);
     const pageHtml = String((page && page.text) || "");
     if (pageHtml) {
-      const w = /<div[^>]*class="[^"]*urlworkaround[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"/i.exec(pageHtml) ||
-                /<a[^>]+href="([^"]+)"[^>]*>\s*(?:Cliquez|Click|Ouvrir)/i.exec(pageHtml);
+      const w =
+        /<div[^>]*class="[^"]*urlworkaround[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"/i.exec(pageHtml) ||
+        /<a[^>]+href="([^"]+)"[^>]*>\s*(?:Cliquez|Click|Ouvrir)/i.exec(pageHtml);
       if (w) target = absolutize(w[1], mod.url);
       if (!target) {
         const embeds = extractEmbeds(pageHtml, mod.url);
@@ -1241,81 +1618,89 @@ async function handleModuleHTML(client, mod, secDir, courseId, links) {
     if (!target) target = mod.url;
 
     if (isSameSite(target) && /pluginfile\.php/i.test(target)) {
-      await saveFile(client, secDir, filenameFromUrl(target, modLabel), target, {
+      const saved = await saveFile(client, secDir, filenameFromUrl(target, modLabel), target, {
         key: `${courseId}:${mod.id}:url-file`,
       });
+      remember(target, saved);
     } else {
       writeLink(secDir, modLabel, target, links);
       log(`      ↗︎ ${modLabel}`);
     }
-    return;
+    return { files, target };
   }
 
   // 2. Pages / livres : on enregistre le contenu en HTML lisible hors-ligne.
   if (mod.modname === "page" || mod.modname === "book") {
     const page = await client.fetch(mod.url);
     const pageHtml = String(page.text || "");
-    if (!pageHtml) return;
-    savePage(secDir, modLabel, pageHtml, mod.url);
-    await downloadAssets(client, pageHtml, mod, secDir, courseId, links);
+    if (!pageHtml) return { files, target: mod.url };
+
+    const saved = savePage(secDir, modLabel, pageHtml, mod.url);
+    remember(mod.url, saved);
+    await downloadAssets(client, pageHtml, mod, secDir, courseId, links, localByUrl);
 
     if (mod.modname === "book") {
       const chapRe = /href="([^"]*\/mod\/book\/view\.php\?id=\d+(?:&amp;|&)chapterid=(\d+)[^"]*)"/gi;
       const done = {};
+      const bookDir = fm.joinPath(secDir, sanitize(modLabel, "livre"));
       let c;
       while ((c = chapRe.exec(pageHtml))) {
         if (done[c[2]]) continue;
         done[c[2]] = true;
-        const url = absolutize(c[1], mod.url);
-        const chap = await safe(() => client.fetch(url), null);
+        const chapUrl = absolutize(c[1], mod.url);
+        const chap = await safe(() => client.fetch(chapUrl), null);
         const chtml = String((chap && chap.text) || "");
         if (!chtml) continue;
-        let title = /<h[23][^>]*>([\s\S]*?)<\/h[23]>/i.exec(chtml);
+        const title = /<h[23][^>]*>([\s\S]*?)<\/h[23]>/i.exec(chtml);
         const chapName = `${modLabel} - ${stripTags(title ? title[1] : "") || `chapitre ${c[2]}`}`;
-        savePage(fm.joinPath(secDir, sanitize(modLabel, "livre")), chapName, chtml, url);
-        await downloadAssets(client, chtml, mod, fm.joinPath(secDir, sanitize(modLabel, "livre")), courseId, links);
+        const chapPath = savePage(bookDir, chapName, chtml, chapUrl);
+        remember(chapUrl, chapPath);
+        await downloadAssets(client, chtml, mod, bookDir, courseId, links, localByUrl);
       }
     }
-    return;
+    return { files, target: mod.url };
   }
 
-  // 3. Cas général (ressource, dossier, devoir, glossaire…) :
-  //    on ouvre l'activité et on récupère tout ce qui ressemble à un fichier.
+  // 3. Cas général (ressource, dossier, devoir, glossaire…).
   const res = await client.fetch(mod.url);
 
   // La page a directement renvoyé le fichier (redirection Moodle vers pluginfile).
   if (!res.text && res.data) {
     const nameFromHeader = filenameFromDisposition(res.disposition);
     const fname = nameFromHeader || filenameFromUrl(res.finalUrl, modLabel);
-    const path = uniquePath(ensureDir(secDir), sanitize(fname, modLabel), `${courseId}:${mod.id}:direct`);
-    if (!CONFIG.overwrite && fm.fileExists(path) && manifest[`${courseId}:${mod.id}:direct`]) {
+    const key = `${courseId}:${mod.id}:direct`;
+    const path = uniquePath(ensureDir(secDir), sanitize(fname, modLabel), key);
+    if (!CONFIG.overwrite && fm.fileExists(path) && manifest[key]) {
       stats.skipped++;
       log(`      = ${fm.fileName(path, true)}`);
-      return;
+      remember(mod.url, path);
+      return { files, target: mod.url };
     }
     fm.write(path, res.data);
     const written = Math.round((fm.fileSize(path) || 0) * 1024);
-    manifest[`${courseId}:${mod.id}:direct`] = { path, size: res.size || written, time: 0 };
+    manifest[key] = { path, size: res.size || written, time: 0 };
     stats.files++;
     stats.bytes += res.size || written;
     log(`      ↓ ${fm.fileName(path, true)} (${humanSize(res.size || written)})`);
-    return;
+    remember(mod.url, path);
+    return { files, target: mod.url };
   }
 
   const pageHtml = String(res.text || "");
-  if (!pageHtml) return;
+  if (!pageHtml) return { files, target: mod.url };
 
-  const files = extractPluginfileUrls(pageHtml, mod.url);
-  const multi = files.length > 1;
+  const found = extractPluginfileUrls(pageHtml, mod.url);
+  const multi = found.length > 1;
   const dir = multi ? fm.joinPath(secDir, sanitize(modLabel, `module-${mod.id}`)) : secDir;
-  for (const f of files) {
-    await safe(
+  for (const f of found) {
+    const saved = await safe(
       () =>
         saveFile(client, dir, filenameFromUrl(f, modLabel), f, {
           key: `${courseId}:${mod.id}:${f}`,
         }),
       null
     );
+    remember(f, saved);
   }
 
   for (const e of extractEmbeds(pageHtml, mod.url)) {
@@ -1323,23 +1708,26 @@ async function handleModuleHTML(client, mod, secDir, courseId, links) {
     log(`      ↗︎ média intégré : ${e}`);
   }
 
-  if (!files.length && !mod.url.includes("/mod/label/")) {
+  if (!found.length && !mod.url.includes("/mod/label/")) {
     writeLink(fm.joinPath(secDir, "_activités"), modLabel, mod.url, null);
   }
+
+  return { files, target: mod.url };
 }
 
 /** Images/fichiers référencés dans une page + médias intégrés. */
-async function downloadAssets(client, html, mod, dir, courseId, links) {
+async function downloadAssets(client, html, mod, dir, courseId, links, localByUrl) {
   const assetsDir = fm.joinPath(dir, sanitize(`${mod.name} - fichiers`, "fichiers"));
-  const files = extractPluginfileUrls(html, mod.url);
-  for (const f of files) {
-    await safe(
+  const found = extractPluginfileUrls(html, mod.url);
+  for (const f of found) {
+    const saved = await safe(
       () =>
         saveFile(client, assetsDir, filenameFromUrl(f, "fichier"), f, {
           key: `${courseId}:${mod.id}:${f}`,
         }),
       null
     );
+    if (saved && localByUrl) localByUrl[absolutize(f, BASE)] = saved;
   }
   for (const e of extractEmbeds(html, mod.url)) {
     writeLink(assetsDir, `${mod.name} - média`, e, links);
@@ -1347,7 +1735,7 @@ async function downloadAssets(client, html, mod, dir, courseId, links) {
 }
 
 /** Écrit LIENS.md et INDEX.md à la fin d'un cours. */
-function finishCourse(courseDir, name, links, index) {
+function finishCourse(courseDir, name, links, doc) {
   if (CONFIG.saveLinks && links.length) {
     const md = [`# Liens externes — ${name}`, ""]
       .concat(links.map((l) => `- [${l.name}](${l.url})`))
@@ -1355,8 +1743,8 @@ function finishCourse(courseDir, name, links, index) {
     try { fm.writeString(fm.joinPath(courseDir, "LIENS.md"), md + "\n"); }
     catch (e) { fail("LIENS.md : " + e); }
   }
-  if (CONFIG.saveIndex) {
-    try { fm.writeString(fm.joinPath(courseDir, "INDEX.md"), index.join("\n") + "\n"); }
+  if (CONFIG.saveIndex && doc) {
+    try { fm.writeString(fm.joinPath(courseDir, "INDEX.md"), renderIndexMarkdown(doc)); }
     catch (e) { fail("INDEX.md : " + e); }
   }
 }
