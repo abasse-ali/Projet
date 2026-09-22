@@ -18,6 +18,13 @@
 //  web sur la page « Clés de sécurité », il est mémorisé et réutilisé aux
 //  lancements suivants : même authentification, sans avoir à se reconnecter.
 //
+//  RANGEMENT — deux façons, au choix (CONFIG.layout / CONFIG.askLayout)
+//    "sections"   : un dossier par section du cours, comme sur Moodle.
+//    "categories" : un dossier par type — Documents, Présentations, Tableurs,
+//                   Code, Pages, Images, Vidéos, Audio, Archives, Liens, Autres.
+//  Dans les deux cas, INDEX.md et INDEX.html suivent le plan du cours et
+//  pointent vers les fichiers là où ils ont été rangés.
+//
 //  STOCKAGE — à lire une fois
 //  FileManager.local().documentsDirectory() est un conteneur INTERNE que l'app
 //  Fichiers n'affiche pas. Ce que Fichiers montre sous « Scriptable », c'est le
@@ -39,6 +46,8 @@ const CONFIG = {
 
   // --- Stockage ------------------------------------------------------------
   rootFolderName: "Moodle STRI",
+  layout: "sections",       // "sections" = un dossier par section ; "categories" = Documents/, Vidéos/, Images/…
+  askLayout: true,          // true = demander le rangement à chaque lancement
   includeCourseId: false,         // true = « 45 - Bases de données » ; false = « Bases de données »
   bookmarkName: "File Provider Storage", // signet Scriptable ; "" = conteneur interne (invisible dans Fichiers)
   useICloud: false,               // false = local ; true = iCloud Drive
@@ -77,7 +86,7 @@ const KC = { token: "moodle_stri_token" };
 // laisser traîner un mot de passe dans le trousseau.
 const KC_LEGACY = ["moodle_stri_user", "moodle_stri_pass"];
 
-const stats = { files: 0, skipped: 0, links: 0, pages: 0, bytes: 0, errors: [] };
+const stats = { files: 0, skipped: 0, moved: 0, links: 0, pages: 0, bytes: 0, errors: [] };
 
 // ---------------------------------------------------------------------------
 //  Petits utilitaires
@@ -269,6 +278,26 @@ function saveManifest() {
   catch (e) { fail("Écriture du manifeste : " + e); }
 }
 
+/**
+ * Le fichier est déjà là, mais ailleurs (rangement changé, dossier renommé) :
+ * on le déplace plutôt que de le retélécharger.
+ */
+function relocate(key, target, dir) {
+  const known = manifest[key];
+  if (!known || !known.path || known.path === target) return false;
+  if (!fm.fileExists(known.path)) return false;
+  try {
+    ensureDir(dir);
+    fm.move(known.path, target);
+    manifest[key] = { path: target, size: known.size || 0, time: known.time || 0 };
+    stats.moved++;
+    return true;
+  } catch (e) {
+    warn(`Déplacement impossible : ${e}`);
+    return false;
+  }
+}
+
 /** À quelle ressource appartient ce chemin, d'après le manifeste ? */
 function pathOwner(path) {
   for (const k of Object.keys(manifest)) {
@@ -288,20 +317,34 @@ function pathOwner(path) {
  * chaque exécution. Elle calculait de surcroît l'extension sur le nom déjà
  * suffixé tout en découpant le nom d'origine, d'où « Séquence 0.pdf (3) ».
  */
-function uniquePath(dir, filename, key) {
+function uniquePath(dir, filename, key, altName) {
   const name = sanitize(filename, "fichier");
   const dot = name.lastIndexOf(".");
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const ext = dot > 0 ? name.slice(dot) : "";
 
-  let path = fm.joinPath(dir, name);
-  let n = 2;
-  while (fm.fileExists(path)) {
+  const free = (path) => {
+    if (!fm.fileExists(path)) return true;
     const owner = pathOwner(path);
-    if (!owner || owner === key) break; // libre, ou déjà à nous
+    return !owner || owner === key; // libre, ou déjà à nous
+  };
+
+  let path = fm.joinPath(dir, name);
+  if (free(path)) return path;
+
+  // Deux activités qui livrent le même nom de fichier : l'intitulé de
+  // l'activité est plus parlant qu'un « (2) ». Indispensable en rangement par
+  // catégories, où tout le cours se retrouve dans un même dossier.
+  const alt = sanitize(String(altName || ""), "");
+  if (alt) {
+    const full = /\.[a-z0-9]{1,8}$/i.test(alt) ? alt : alt + ext;
+    path = fm.joinPath(dir, full);
+    if (free(path)) return path;
+  }
+
+  for (let n = 2; n <= 50; n++) {
     path = fm.joinPath(dir, `${stem} (${n})${ext}`);
-    n++;
-    if (n > 50) break;
+    if (free(path)) return path;
   }
   return path;
 }
@@ -535,6 +578,55 @@ function filenameFromDisposition(disposition) {
 
 const IMAGE_EXT = /\.(jpe?g|png|gif|heic|heif|webp|tiff?)$/i;
 
+// ---------------------------------------------------------------------------
+//  Rangement par catégories
+// ---------------------------------------------------------------------------
+const CATEGORIES = [
+  { name: "Documents",     ext: /\.(pdf|docx?|odt|rtf|txt|md|tex|pages)$/i },
+  { name: "Présentations", ext: /\.(pptx?|odp|key)$/i },
+  { name: "Tableurs",      ext: /\.(xlsx?|ods|csv|tsv|numbers)$/i },
+  { name: "Code",          ext: /\.(sql|py|js|ts|java|c|cpp|h|hpp|sh|json|xml|ya?ml|ipynb|php|rb|go|rs|cs|pls?)$/i },
+  { name: "Pages",         ext: /\.(html?|mhtml)$/i },
+  { name: "Images",        ext: /\.(jpe?g|png|gif|heic|heif|webp|svg|bmp|tiff?)$/i },
+  { name: "Vidéos",        ext: /\.(mp4|mov|m4v|avi|mkv|webm|wmv|flv|mpe?g)$/i },
+  { name: "Audio",         ext: /\.(mp3|m4a|wav|aac|ogg|flac|aiff?)$/i },
+  { name: "Archives",      ext: /\.(zip|rar|7z|tar|gz|tgz|bz2|xz)$/i },
+];
+
+/** Catégorie d'un fichier, d'après son extension puis le type d'activité. */
+function categoryFor(filename, modname) {
+  const n = String(filename || "");
+  if (/\.(url|webloc)$/i.test(n) || modname === "url") return "Liens";
+  for (const c of CATEGORIES) if (c.ext.test(n)) return c.name;
+  if (modname === "page" || modname === "book") return "Pages";
+  return "Autres";
+}
+
+function byCategories() {
+  return CONFIG.layout === "categories";
+}
+
+/**
+ * Où écrire un fichier.
+ * ctx : { courseDir, secDir, modName, modId, modname, filename, multi, filepath }
+ */
+function fileDestDir(ctx) {
+  if (byCategories()) {
+    return fm.joinPath(ctx.courseDir, categoryFor(ctx.filename, ctx.modname));
+  }
+  let dir = ctx.secDir;
+  if (ctx.multi) dir = fm.joinPath(dir, sanitize(ctx.modName, `module-${ctx.modId}`));
+  const sub = String(ctx.filepath || "/").replace(/^\/+|\/+$/g, "");
+  if (sub) dir = fm.joinPath(dir, sanitize(sub.replace(/\//g, " - "), ""));
+  return dir;
+}
+
+/** Où écrire un raccourci .url ou une page enregistrée. */
+function sideDestDir(courseDir, secDir, category, sub) {
+  if (byCategories()) return fm.joinPath(courseDir, category);
+  return sub ? fm.joinPath(secDir, sub) : secDir;
+}
+
 /** Extension déduite du type MIME, quand l'URL n'en donne aucune. */
 function extForContentType(ct) {
   const c = String(ct || "").toLowerCase();
@@ -571,7 +663,7 @@ async function saveFile(client, dir, filename, url, meta) {
   const key = meta.key;
   const known = manifest[key];
   const name = sanitize(filename, "fichier");
-  const target = uniquePath(ensureDir(dir), name, key);
+  const target = uniquePath(ensureDir(dir), name, key, meta.label);
 
   if (!CONFIG.overwrite && fm.fileExists(target)) {
     const sameSize = !meta.size || !known || known.size === meta.size;
@@ -580,6 +672,15 @@ async function saveFile(client, dir, filename, url, meta) {
       stats.skipped++;
       log(`      = ${name}`);
       manifest[key] = { path: target, size: meta.size || (known && known.size) || 0, time: meta.time || 0 };
+      return target;
+    }
+  }
+
+  if (!CONFIG.overwrite) {
+    const sameSize = !meta.size || !known || known.size === meta.size;
+    const sameTime = !meta.time || !known || known.time === meta.time;
+    if (sameSize && sameTime && relocate(key, target, dir)) {
+      log(`      ↦ ${name}`);
       return target;
     }
   }
@@ -621,7 +722,7 @@ async function saveFile(client, dir, filename, url, meta) {
   const fromHeader = sanitize(filenameFromDisposition(res.disposition), "");
   let finalPath = target;
   if (fromHeader && fromHeader !== name && !/\.[a-z0-9]{1,8}$/i.test(name)) {
-    finalPath = uniquePath(dir, fromHeader, key);
+    finalPath = uniquePath(dir, fromHeader, key, meta.label);
   }
 
   fm.write(finalPath, data);
@@ -1586,7 +1687,7 @@ async function syncCourseWS(token, courseId, courseName) {
       }
 
       for (const u of urls) {
-        writeLink(secDir, modName, u.fileurl, links);
+        writeLink(sideDestDir(courseDir, secDir, "Liens"), modName, u.fileurl, links);
         log(`      ↗︎ ${modName}`);
       }
 
@@ -1594,20 +1695,19 @@ async function syncCourseWS(token, courseId, courseName) {
 
       if (files.length) {
         const multi = files.length > 1;
-        const targetDir = multi
-          ? fm.joinPath(secDir, sanitize(modName, `module-${mod.id}`))
-          : secDir;
 
         for (const f of files) {
-          const sub = String(f.filepath || "/").replace(/^\/+|\/+$/g, "");
-          const dir = sub
-            ? fm.joinPath(targetDir, sanitize(sub.replace(/\//g, " - "), ""))
-            : targetDir;
           let fname = f.filename || filenameFromUrl(f.fileurl, modName);
           if (!multi && /^index\.html?$/i.test(fname)) fname = `${sanitize(modName, "page")}.html`;
           else if (!multi && files.length === 1 && fname && !/\./.test(fname)) {
             fname = sanitize(modName, fname);
           }
+
+          const dir = fileDestDir({
+            courseDir, secDir, modName, modId: mod.id, modname: mod.modname,
+            filename: fname, multi, filepath: f.filepath,
+          });
+
           const url = withParams(f.fileurl, { token, forcedownload: 1 });
           const saved = await safe(
             () =>
@@ -1615,6 +1715,7 @@ async function syncCourseWS(token, courseId, courseName) {
                 key: `${courseId}:${mod.id}:${f.filepath || "/"}${f.filename || fname}`,
                 size: Number(f.filesize || 0),
                 time: Number(f.timemodified || 0),
+                label: modName,
               }),
             null
           );
@@ -1625,7 +1726,7 @@ async function syncCourseWS(token, courseId, courseName) {
         }
       } else if (mod.url && !urls.length && mod.modname !== "url") {
         // Pas de fichier exposé : on garde au moins le lien vers l'activité.
-        writeLink(fm.joinPath(secDir, "_activités"), modName, mod.url, null);
+        writeLink(sideDestDir(courseDir, secDir, "Liens", "_activités"), modName, mod.url, null);
       }
 
       docSec.items.push({
@@ -1710,11 +1811,13 @@ async function syncCourseHTML(client, courseId, courseName) {
     const docSec = { name: secLabel, summaryHtml: sec.summaryHtml || "", items: [] };
 
     for (const f of sec.inlineFiles) {
+      const fname = filenameFromUrl(f, "fichier");
+      const dir = fileDestDir({
+        courseDir, secDir, modName: secLabel, modId: sec.index,
+        modname: "", filename: fname, multi: false,
+      });
       const saved = await safe(
-        () =>
-          saveFile(client, secDir, filenameFromUrl(f, "fichier"), f, {
-            key: `${courseId}:inline:${f}`,
-          }),
+        () => saveFile(client, dir, fname, f, { key: `${courseId}:inline:${f}` }),
         null
       );
       if (saved) localByUrl[f] = saved;
@@ -1729,7 +1832,7 @@ async function syncCourseHTML(client, courseId, courseName) {
 
       const outcome =
         (await safe(
-          () => handleModuleHTML(client, mod, secDir, courseId, links, localByUrl),
+          () => handleModuleHTML(client, mod, { courseDir, secDir }, courseId, links, localByUrl),
           null
         )) || {};
 
@@ -1758,7 +1861,8 @@ async function syncCourseHTML(client, courseId, courseName) {
  * Traite une activité. Retourne { files: [chemins locaux], target: URL retenue }
  * pour que INDEX.md pointe vers le fichier téléchargé quand il existe.
  */
-async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl) {
+async function handleModuleHTML(client, mod, dirs, courseId, links, localByUrl) {
+  const { courseDir, secDir } = dirs;
   const modLabel = mod.name || mod.modname;
   const files = [];
   const remember = (remoteUrl, path) => {
@@ -1766,6 +1870,11 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
     files.push(path);
     if (remoteUrl) localByUrl[absolutize(remoteUrl, BASE)] = path;
   };
+  const destFor = (filename, multi) =>
+    fileDestDir({
+      courseDir, secDir, modName: modLabel, modId: mod.id,
+      modname: mod.modname, filename, multi: !!multi,
+    });
 
   // 1. Liens externes : on demande à Moodle de ne pas rediriger.
   if (mod.modname === "url") {
@@ -1786,12 +1895,14 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
     if (!target) target = mod.url;
 
     if (isSameSite(target) && /pluginfile\.php/i.test(target)) {
-      const saved = await saveFile(client, secDir, filenameFromUrl(target, modLabel), target, {
+      const fname = filenameFromUrl(target, modLabel);
+      const saved = await saveFile(client, destFor(fname), fname, target, {
         key: `${courseId}:${mod.id}:url-file`,
+        label: modLabel,
       });
       remember(target, saved);
     } else {
-      writeLink(secDir, modLabel, target, links);
+      writeLink(sideDestDir(courseDir, secDir, "Liens"), modLabel, target, links);
       log(`      ↗︎ ${modLabel}`);
     }
     return { files, target };
@@ -1803,14 +1914,17 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
     const pageHtml = String(page.text || "");
     if (!pageHtml) return { files, target: mod.url };
 
-    const saved = savePage(secDir, modLabel, pageHtml, mod.url);
+    const pagesDir = sideDestDir(courseDir, secDir, "Pages");
+    const saved = savePage(pagesDir, modLabel, pageHtml, mod.url);
     remember(mod.url, saved);
-    await downloadAssets(client, pageHtml, mod, secDir, courseId, links, localByUrl);
+    await downloadAssets(client, pageHtml, mod, dirs, courseId, links, localByUrl);
 
     if (mod.modname === "book") {
       const chapRe = /href="([^"]*\/mod\/book\/view\.php\?id=\d+(?:&amp;|&)chapterid=(\d+)[^"]*)"/gi;
       const done = {};
-      const bookDir = fm.joinPath(secDir, sanitize(modLabel, "livre"));
+      const bookDir = byCategories()
+        ? pagesDir
+        : fm.joinPath(secDir, sanitize(modLabel, "livre"));
       let c;
       while ((c = chapRe.exec(pageHtml))) {
         if (done[c[2]]) continue;
@@ -1821,9 +1935,8 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
         if (!chtml) continue;
         const title = /<h[23][^>]*>([\s\S]*?)<\/h[23]>/i.exec(chtml);
         const chapName = `${modLabel} - ${stripTags(title ? title[1] : "") || `chapitre ${c[2]}`}`;
-        const chapPath = savePage(bookDir, chapName, chtml, chapUrl);
-        remember(chapUrl, chapPath);
-        await downloadAssets(client, chtml, mod, bookDir, courseId, links, localByUrl);
+        remember(chapUrl, savePage(bookDir, chapName, chtml, chapUrl));
+        await downloadAssets(client, chtml, mod, dirs, courseId, links, localByUrl);
       }
     }
     return { files, target: mod.url };
@@ -1852,7 +1965,13 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
     if (!data && res.text != null) data = Data.fromString(res.text);
     if (!data) return { files, target: mod.url };
 
-    const path = uniquePath(ensureDir(secDir), fname, key);
+    const destDir = destFor(fname);
+    const path = uniquePath(ensureDir(destDir), fname, key, modLabel);
+    if (!CONFIG.overwrite && relocate(key, path, destDir)) {
+      log(`      ↦ ${fm.fileName(path, true)}`);
+      remember(mod.url, path);
+      return { files, target: mod.url };
+    }
     if (!CONFIG.overwrite && fm.fileExists(path) && manifest[key]) {
       stats.skipped++;
       log(`      = ${fm.fileName(path, true)}`);
@@ -1874,12 +1993,13 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
 
   const found = extractPluginfileUrls(pageHtml, mod.url);
   const multi = found.length > 1;
-  const dir = multi ? fm.joinPath(secDir, sanitize(modLabel, `module-${mod.id}`)) : secDir;
   for (const f of found) {
+    const fname = filenameFromUrl(f, modLabel);
     const saved = await safe(
       () =>
-        saveFile(client, dir, filenameFromUrl(f, modLabel), f, {
+        saveFile(client, destFor(fname, multi), fname, f, {
           key: `${courseId}:${mod.id}:${f}`,
+          label: modLabel,
         }),
       null
     );
@@ -1887,33 +2007,39 @@ async function handleModuleHTML(client, mod, secDir, courseId, links, localByUrl
   }
 
   for (const e of extractEmbeds(pageHtml, mod.url)) {
-    writeLink(dir, `${modLabel} - média`, e, links);
+    writeLink(sideDestDir(courseDir, secDir, "Liens"), `${modLabel} - média`, e, links);
     log(`      ↗︎ média intégré : ${e}`);
   }
 
   if (!found.length && !mod.url.includes("/mod/label/")) {
-    writeLink(fm.joinPath(secDir, "_activités"), modLabel, mod.url, null);
+    writeLink(sideDestDir(courseDir, secDir, "Liens", "_activités"), modLabel, mod.url, null);
   }
 
   return { files, target: mod.url };
 }
 
 /** Images/fichiers référencés dans une page + médias intégrés. */
-async function downloadAssets(client, html, mod, dir, courseId, links, localByUrl) {
-  const assetsDir = fm.joinPath(dir, sanitize(`${mod.name} - fichiers`, "fichiers"));
+async function downloadAssets(client, html, mod, dirs, courseId, links, localByUrl) {
+  const { courseDir, secDir } = dirs;
+  const label = mod.name || mod.modname;
   const found = extractPluginfileUrls(html, mod.url);
   for (const f of found) {
+    const fname = filenameFromUrl(f, "fichier");
+    const dir = byCategories()
+      ? fm.joinPath(courseDir, categoryFor(fname, ""))
+      : fm.joinPath(secDir, sanitize(`${label} - fichiers`, "fichiers"));
     const saved = await safe(
       () =>
-        saveFile(client, assetsDir, filenameFromUrl(f, "fichier"), f, {
+        saveFile(client, dir, fname, f, {
           key: `${courseId}:${mod.id}:${f}`,
+          label,
         }),
       null
     );
     if (saved && localByUrl) localByUrl[absolutize(f, BASE)] = saved;
   }
   for (const e of extractEmbeds(html, mod.url)) {
-    writeLink(assetsDir, `${mod.name} - média`, e, links);
+    writeLink(sideDestDir(courseDir, secDir, "Liens", `${label} - fichiers`), `${label} - média`, e, links);
   }
 }
 
@@ -2032,6 +2158,8 @@ function summary(started) {
     "──────────── Résumé ────────────",
     `Fichiers téléchargés : ${stats.files} (${humanSize(stats.bytes)})`,
     `Déjà à jour          : ${stats.skipped}`,
+    `Déplacés             : ${stats.moved}`,
+    `Rangement            : ${byCategories() ? "par catégories" : "par sections"}`,
     `Pages enregistrées   : ${stats.pages}`,
     `Liens externes       : ${stats.links}`,
     `Erreurs              : ${stats.errors.length}`,
@@ -2054,6 +2182,19 @@ async function main() {
   ensureDir(ROOT);
   log(`Destination : ${ROOT}`);
   await loadManifest();
+
+  if (CONFIG.askLayout && config.runsInApp) {
+    const a = new Alert();
+    a.title = "Rangement des fichiers";
+    a.message = "Comment ranger les fichiers de ce cours ?";
+    a.addAction("Par sections du cours");
+    a.addAction("Par catégories (Documents, Vidéos…)");
+    a.addCancelAction("Annuler");
+    const c = await a.presentAlert();
+    if (c === -1) throw new Error("Annulé.");
+    CONFIG.layout = c === 1 ? "categories" : "sections";
+  }
+  log(`Rangement : ${byCategories() ? "par catégories" : "par sections"}`);
 
   const auth = await connect();
   let targets = resolveCourseIds().map((id) => ({ id, name: null }));
