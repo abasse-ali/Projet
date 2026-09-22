@@ -51,7 +51,8 @@ const CONFIG = {
   savePages: true,          // "Pages" Moodle enregistrées en .html
   saveLinks: true,          // liens externes -> fichiers .url + LIENS.md
   linkFileFormat: "url",    // "url" | "html" | "webloc"
-  saveIndex: true,          // INDEX.md récapitulatif par cours
+  saveIndex: true,          // INDEX.md : copie Markdown de la page du cours
+  saveIndexHtml: true,      // INDEX.html : même contenu, liens cliquables sur iOS
   saveImagesToPhotos: false,// true = copie aussi les images dans Photos
 
   // --- Divers --------------------------------------------------------------
@@ -1029,18 +1030,21 @@ function baseName(p) {
 }
 
 /**
- * Lien Markdown.
+ * Cible d'un lien Markdown : chevrons si le chemin contient des espaces.
  *
- * Les espaces et parenthèses sont encodés plutôt que protégés par des
- * chevrons : `<mon chemin>` serait pris pour une balise et supprimé par le
- * nettoyage final de htmlToMarkdown, ce qui viderait le lien.
+ * On garde le chemin lisible plutôt que de tout percent-encoder : plusieurs
+ * lecteurs Markdown ne décodent pas « %20 » pour retrouver un fichier local
+ * et le lien ne mène alors nulle part.
  */
+function mdTarget(url) {
+  const u = String(url == null ? "" : url);
+  return /[ ()<>]/.test(u) ? "<" + u + ">" : u;
+}
+
 function mdLink(label, url) {
   const lab = String(label == null ? "" : label).replace(/[\[\]]/g, "").trim() || "(sans titre)";
-  let u = String(url == null ? "" : url);
-  if (!u) return lab;
-  u = u.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
-  return `[${lab}](${u})`;
+  const u = String(url == null ? "" : url);
+  return u ? `[${lab}](${mdTarget(u)})` : lab;
 }
 
 /** Texte d'un fragment inline, balises retirées. */
@@ -1080,6 +1084,15 @@ function htmlToMarkdown(html, opts) {
   const minLevel = o.minLevel || 1;
   let s = String(html == null ? "" : html);
 
+  // Les cibles de liens sont remplacées par un jeton le temps de la
+  // conversion : « <mon chemin/fichier.pdf> » serait sinon pris pour une
+  // balise et effacé par le retrait final des balises.
+  const targets = [];
+  const hold = (u) => {
+    targets.push(u);
+    return "\u0001L" + (targets.length - 1) + "\u0001";
+  };
+
   s = s.replace(/<!--[\s\S]*?-->/g, " ");
   s = s.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ");
 
@@ -1112,16 +1125,16 @@ function htmlToMarkdown(html, opts) {
     const src = (/src\s*=\s*["']([^"']+)["']/i.exec(tag) || [])[1] || "";
     const alt = (/alt\s*=\s*["']([^"']*)["']/i.exec(tag) || [])[1] || "";
     const url = src ? resolve(src) : "";
-    if (!url) return "";
-    const safeUrl = url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
-    return `![${decodeEntities(alt)}](${safeUrl})`;
+    return url ? `![${decodeEntities(alt)}](${hold(url)})` : "";
   });
 
   s = s.replace(/<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, body) => {
     const label = inlineText(body);
     if (!label) return "";
     const url = resolve(href);
-    return url ? mdLink(label, url) : label;
+    if (!url) return label;
+    const lab = label.replace(/[\[\]]/g, "");
+    return `[${lab}](${hold(url)})`;
   });
 
   s = s.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, c) => {
@@ -1145,6 +1158,9 @@ function htmlToMarkdown(html, opts) {
   s = s.replace(/\r/g, "");
   s = s.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n");
   s = s.replace(/\n{3,}/g, "\n\n");
+
+  // Les cibles reviennent maintenant que plus aucune balise n'est retirée.
+  s = s.replace(/\u0001L(\d+)\u0001/g, (_, i) => mdTarget(targets[Number(i)]));
   return s.trim();
 }
 
@@ -1187,6 +1203,9 @@ function renderItem(it) {
 function renderIndexMarkdown(doc) {
   const out = [`# ${doc.title}`, ""];
   out.push(`*Copie locale de <${doc.sourceUrl}> — ${doc.date}*`, "");
+  if (CONFIG.saveIndexHtml) {
+    out.push("*Liens qui ne s'ouvrent pas ? Utilise [INDEX.html](INDEX.html) dans un navigateur.*", "");
+  }
 
   for (const sec of doc.sections || []) {
     const hasContent =
@@ -1226,6 +1245,14 @@ function renderIndexMarkdown(doc) {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
 }
 
+/** Réécrit href/src d'un fragment HTML vers les fichiers téléchargés. */
+function rewriteLocalUrls(html, resolve) {
+  return String(html || "").replace(
+    /(href|src)\s*=\s*["']([^"']+)["']/gi,
+    (_, attr, u) => `${attr}="${escapeXml(encodeURI(resolve(u)))}"`
+  );
+}
+
 /** Remplace une URL par le chemin local du fichier téléchargé, s'il existe. */
 function makeResolver(courseDir, localByUrl) {
   return (href) => {
@@ -1233,6 +1260,79 @@ function makeResolver(courseDir, localByUrl) {
     const local = localByUrl[abs];
     return local ? relPath(courseDir, local) : abs;
   };
+}
+
+/**
+ * Même contenu qu'INDEX.md, mais en page web.
+ *
+ * Sur iOS, la plupart des visionneuses Markdown n'ouvrent pas un lien relatif
+ * vers un fichier voisin. Ouverte dans un navigateur, cette page-ci le fait.
+ */
+function renderIndexHtml(doc) {
+  const esc = escapeXml;
+  const href = (p) => esc(encodeURI(String(p || "")));
+  const out = [
+    "<!doctype html>",
+    '<html lang="fr">',
+    "<head>",
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    `<title>${esc(doc.title)}</title>`,
+    "<style>",
+    "body{font:17px/1.55 -apple-system,system-ui,sans-serif;margin:0 auto;padding:1.2em;" +
+      "max-width:44em;color:#1c1c1e;background:#fff}",
+    "h1{font-size:1.55em;margin:0 0 .2em}",
+    "h2{margin:1.8em 0 .5em;padding-bottom:.25em;border-bottom:1px solid #d1d1d6;font-size:1.2em}",
+    "ul.activities{list-style:none;padding:0;margin:.6em 0}",
+    "ul.activities>li{margin:.5em 0}",
+    ".ico{display:inline-block;width:1.4em}",
+    ".desc{margin:.15em 0 .9em 1.4em;font-size:.94em;opacity:.85}",
+    ".src{font-size:.85em;opacity:.65;margin-top:0}",
+    "img{max-width:100%;height:auto}",
+    "table{border-collapse:collapse;margin:.5em 0}td,th{border:1px solid #c7c7cc;padding:.25em .55em}",
+    "@media (prefers-color-scheme:dark){body{background:#000;color:#e5e5ea}" +
+      "a{color:#0a84ff}h2{border-color:#3a3a3c}td,th{border-color:#48484a}}",
+    "</style>",
+    "</head>",
+    "<body>",
+    `<h1>${esc(doc.title)}</h1>`,
+    `<p class="src">Copie locale de <a href="${esc(doc.sourceUrl)}">${esc(doc.sourceUrl)}</a>` +
+      ` — ${esc(doc.date)}</p>`,
+  ];
+
+  for (const sec of doc.sections || []) {
+    out.push(`<h2>${esc(sec.name || "Section")}</h2>`);
+    if (sec.summaryHtml && sec.summaryHtml.trim()) out.push(`<div>${sec.summaryHtml}</div>`);
+
+    let openList = false;
+    for (const it of sec.items || []) {
+      if (it.kind === "text") {
+        if (openList) { out.push("</ul>"); openList = false; }
+        if (it.html && it.html.trim()) out.push(`<div>${it.html}</div>`);
+        continue;
+      }
+      if (!openList) { out.push('<ul class="activities">'); openList = true; }
+
+      const target = (it.files && it.files[0]) || it.url || "";
+      const icon = itemIcon(it.modname);
+      const label = esc(it.label || "(sans titre)");
+      const main = target
+        ? `<a href="${href(target)}">${label}</a>`
+        : `<strong>${label}</strong>`;
+      out.push(`<li><span class="ico">${icon}</span>${main}`);
+
+      for (let i = 1; i < (it.files || []).length; i++) {
+        out.push(`<br><span class="ico"></span><a href="${href(it.files[i])}">` +
+                 `${esc(baseName(it.files[i]))}</a>`);
+      }
+      if (it.descHtml && it.descHtml.trim()) out.push(`<div class="desc">${it.descHtml}</div>`);
+      out.push("</li>");
+    }
+    if (openList) out.push("</ul>");
+  }
+
+  out.push("</body>", "</html>");
+  return out.join("\n");
 }
 
 function todayStamp() {
@@ -1425,9 +1525,14 @@ function buildIndexDoc(title, sourceUrl, courseDir, localByUrl, rawSections) {
     sections: rawSections.map((sec) => ({
       name: sec.name,
       summaryMd: htmlToMarkdown(sec.summaryHtml, { resolve, minLevel: 3 }),
+      summaryHtml: rewriteLocalUrls(sec.summaryHtml, resolve),
       items: (sec.items || []).map((it) =>
         it.kind === "text"
-          ? { kind: "text", md: htmlToMarkdown(it.html, { resolve, minLevel: 3 }) }
+          ? {
+              kind: "text",
+              md: htmlToMarkdown(it.html, { resolve, minLevel: 3 }),
+              html: rewriteLocalUrls(it.html, resolve),
+            }
           : {
               kind: "item",
               modname: it.modname,
@@ -1435,6 +1540,7 @@ function buildIndexDoc(title, sourceUrl, courseDir, localByUrl, rawSections) {
               url: it.url,
               files: (it.files || []).map((f) => relPath(courseDir, f)),
               descMd: htmlToMarkdown(it.html, { resolve, minLevel: 4 }),
+              descHtml: rewriteLocalUrls(it.html, resolve),
             }
       ),
     })),
@@ -1823,6 +1929,10 @@ function finishCourse(courseDir, name, links, doc) {
   if (CONFIG.saveIndex && doc) {
     try { fm.writeString(fm.joinPath(courseDir, "INDEX.md"), renderIndexMarkdown(doc)); }
     catch (e) { fail("INDEX.md : " + e); }
+  }
+  if (CONFIG.saveIndexHtml && doc) {
+    try { fm.writeString(fm.joinPath(courseDir, "INDEX.html"), renderIndexHtml(doc)); }
+    catch (e) { fail("INDEX.html : " + e); }
   }
 }
 
