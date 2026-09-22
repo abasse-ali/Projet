@@ -554,7 +554,7 @@ async function saveFile(client, dir, filename, url, meta) {
   if (!data && res.text != null) {
     // Le serveur a renvoyé du texte : soit c'est vraiment un fichier texte/HTML,
     // soit on est retombé sur la page de connexion.
-    if (/id="?login"?|loginform|login\/index\.php/i.test(res.text) && /<html/i.test(res.text)) {
+    if (/<html/i.test(res.text) && /id="page-login-index"|\bnotloggedin\b/i.test(res.text)) {
       fail(`Session expirée en téléchargeant « ${name} »`);
       return null;
     }
@@ -728,6 +728,23 @@ async function askCredentials(message) {
   return { user, pass };
 }
 
+/**
+ * Sommes-nous authentifiés sur cette page ?
+ *
+ * ⚠️ Ne JAMAIS tester « sesskey » : Moodle écrit M.cfg = {"sesskey":"..."} sur
+ * toutes ses pages, connexion comprise. Le test était donc toujours vrai, et
+ * le script prenait la page de login pour une session ouverte.
+ *
+ * Marqueurs négatifs fiables : l'identifiant de page « page-login-index » et
+ * la classe « notloggedin » que Moodle pose sur <body> pour les visiteurs.
+ * Marqueur positif : le lien de déconnexion, rendu pour les seuls connectés.
+ */
+function isLoggedInHtml(html) {
+  const src = String(html || "");
+  if (/id="page-login-index"|\bnotloggedin\b/i.test(src)) return false;
+  return /\/login\/logout\.php/i.test(src);
+}
+
 /** La page de connexion est-elle celle de Moodle, ou un portail SSO externe ? */
 function looksLikeSso(finalUrl, html) {
   if (finalUrl && !isSameSite(finalUrl)) return true;
@@ -777,7 +794,7 @@ async function webLogin(user, pass) {
   });
 
   const check = await http(`${BASE}/my/`, { as: "string" });
-  if (/sesskey|logout\.php|Déconnexion/i.test(String(check.payload || ""))) return true;
+  if (isLoggedInHtml(String(check.payload || ""))) return true;
 
   const reason = loginErrorFromHtml(String(res.payload || ""));
   if (reason) throw new Error(`Moodle a refusé la connexion : ${reason}`);
@@ -815,8 +832,14 @@ async function webViewLogin() {
   await WebViewClient.ensure(wv);
   const probe = await WebViewClient.run(`${BASE}/my/`, false);
   const html = String((probe && probe.text) || "");
-  if (!/sesskey|logout\.php|Déconnexion/i.test(html)) {
-    throw new Error("Connexion WebView non confirmée — réessaie en restant connecté.");
+  if (!isLoggedInHtml(html)) {
+    const t = /<title>([\s\S]*?)<\/title>/i.exec(html);
+    throw new Error(
+      "Connexion non aboutie : la page reçue est « " +
+      (stripTags(t ? t[1] : "") || "sans titre") +
+      " ». Relance, connecte-toi jusqu'à voir ton tableau de bord, et seulement " +
+      "ensuite ferme la fenêtre."
+    );
   }
   return wv;
 }
@@ -968,6 +991,8 @@ function cleanCourseTitle(raw) {
  */
 function courseNameFromHtml(html, courseId) {
   const src = String(html || "");
+  // Ceinture et bretelles : une page de connexion ne nomme jamais un cours.
+  if (/id="page-login-index"|\bnotloggedin\b/i.test(src)) return "";
   const id = String(courseId);
   const candidates = [];
 
@@ -1179,8 +1204,7 @@ async function syncCourseHTML(client, courseId) {
 
   // Preuve POSITIVE d'une session ouverte, plutôt que des mots-clés de login
   // qui sont présents un peu partout dans le HTML de Moodle.
-  const loggedIn = /"sesskey"\s*:\s*"|\/login\/logout\.php/i.test(html);
-  if (!loggedIn) {
+  if (!isLoggedInHtml(html)) {
     const t = /<title>([\s\S]*?)<\/title>/i.exec(html);
     const titre = stripTags(t ? t[1] : "") || "sans titre";
     const cause = looksLikeSso(res.finalUrl, html)
