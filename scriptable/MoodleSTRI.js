@@ -33,6 +33,7 @@ const CONFIG = {
 
   // --- Stockage ------------------------------------------------------------
   rootFolderName: "Moodle STRI",
+  includeCourseId: false,         // true = « 45 - Bases de données » ; false = « Bases de données »
   bookmarkName: "File Provider Storage", // signet Scriptable ; "" = conteneur interne (invisible dans Fichiers)
   useICloud: false,               // false = local ; true = iCloud Drive
   overwrite: false,               // true = re-télécharge tout à chaque fois
@@ -873,21 +874,157 @@ function parseCourseHtml(html) {
 }
 
 // ---------------------------------------------------------------------------
+//  Nom du cours et dossier de destination
+// ---------------------------------------------------------------------------
+
+/** En-têtes de page qui ne sont PAS le nom d'un cours. */
+const GENERIC_TITLES =
+  /^(cours|course|kurs|curso|accueil|home|tableau de bord|dashboard|mes cours|my courses|moodle|navigation|menu|contenu|content|section \d+)$/i;
+
+function isUsableCourseName(s) {
+  const n = String(s == null ? "" : s).trim();
+  return n.length >= 3 && !GENERIC_TITLES.test(n);
+}
+
+/**
+ * Nettoie un titre brut issu du HTML.
+ * Moodle écrit « Cours : Bases de données - Oracle | Moodle STRI ».
+ * On retire le préfixe de type et le nom du site, SANS couper au premier
+ * deux-points : beaucoup d'intitulés en contiennent.
+ */
+function cleanCourseTitle(raw) {
+  let s = stripTags(raw);
+  s = s.replace(/^\s*(?:cours|course|kurs|curso)\s*:\s*/i, "");
+  s = s.replace(/\s*\|\s*[^|]*$/, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Nom complet du cours depuis une page HTML, par ordre de fiabilité
+ * décroissante. Retourne "" si rien d'exploitable.
+ */
+function courseNameFromHtml(html, courseId) {
+  const src = String(html || "");
+  const id = String(courseId);
+  const candidates = [];
+
+  // 1. En-tête de page des thèmes Boost / Classic : le nom exact du cours.
+  let m = /<div[^>]+class="[^"]*page-header-headings[^"]*"[^>]*>\s*<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(src);
+  if (m) candidates.push(m[1]);
+
+  // 2. Fil d'Ariane : l'attribut title du lien du cours porte le nom complet.
+  m = new RegExp(
+    '<a[^>]+href="[^"]*\\/course\\/view\\.php\\?id=' + id + '(?:[^0-9][^"]*)?"[^>]*title="([^"]+)"',
+    "i"
+  ).exec(src);
+  if (m) candidates.push(decodeEntities(m[1]));
+
+  // 3. Texte de ce même lien.
+  m = new RegExp(
+    '<a[^>]+href="[^"]*\\/course\\/view\\.php\\?id=' + id + '(?:[^0-9][^"]*)?"[^>]*>([\\s\\S]*?)<\\/a>',
+    "i"
+  ).exec(src);
+  if (m) candidates.push(m[1]);
+
+  // 4. <title> de la page.
+  m = /<title>([\s\S]*?)<\/title>/i.exec(src);
+  if (m) candidates.push(m[1]);
+
+  // 5. En dernier recours, le premier <h1> non générique.
+  const h1Re = /<h1[^>]*>([\s\S]*?)<\/h1>/gi;
+  let h;
+  while ((h = h1Re.exec(src))) candidates.push(h[1]);
+
+  for (const c of candidates) {
+    const n = cleanCourseTitle(c);
+    if (isUsableCourseName(n)) return n;
+  }
+  return "";
+}
+
+/** Nom de dossier pour un cours, selon CONFIG.includeCourseId. */
+function courseDirName(courseId, name) {
+  const clean = isUsableCourseName(name) ? name : `cours-${courseId}`;
+  return sanitize(
+    CONFIG.includeCourseId ? `${courseId} - ${clean}` : clean,
+    `cours-${courseId}`
+  );
+}
+
+/** Ancien dossier « <id> - … » laissé par une version précédente du script. */
+function findLegacyCourseDir(courseId) {
+  const prefix = `${courseId} - `;
+  let entries = [];
+  try { entries = fm.listContents(ROOT) || []; } catch (e) { return null; }
+  for (const e of entries) {
+    if (e.indexOf(prefix) !== 0) continue;
+    const p = fm.joinPath(ROOT, e);
+    if (fm.isDirectory(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * Dossier du cours, créé si besoin. Si le cours était rangé sous un autre nom
+ * (« 45 - Cours »), le dossier est renommé et les chemins du manifeste suivent,
+ * pour ne rien re-télécharger.
+ */
+function resolveCourseDir(courseId, name) {
+  const target = fm.joinPath(ROOT, courseDirName(courseId, name));
+
+  if (!manifest.__courses) manifest.__courses = {};
+  const previous = manifest.__courses[courseId] || findLegacyCourseDir(courseId);
+
+  if (previous && previous !== target && fm.fileExists(previous) && !fm.fileExists(target)) {
+    try {
+      fm.move(previous, target);
+      for (const k of Object.keys(manifest)) {
+        if (k === "__courses") continue;
+        const p = manifest[k] && manifest[k].path;
+        if (p && p.indexOf(previous + "/") === 0) {
+          manifest[k].path = target + p.slice(previous.length);
+        }
+      }
+      log(`  ↻ Dossier renommé : « ${fm.fileName(previous, true)} » → « ${fm.fileName(target, true)} »`);
+    } catch (e) {
+      warn(`Renommage du dossier de cours impossible : ${e}`);
+    }
+  }
+
+  manifest.__courses[courseId] = target;
+  return ensureDir(target);
+}
+
+// ---------------------------------------------------------------------------
 //  Synchronisation — mode service web (API REST)
 // ---------------------------------------------------------------------------
 async function courseNameWS(token, courseId) {
-  const r = await safe(
+  // displayname porte le nom tel qu'affiché (filtres appliqués).
+  let r = await safe(
     () => wsCall(token, "core_course_get_courses_by_field", { field: "id", value: courseId }),
     null
   );
-  const c = r && r.courses && r.courses[0];
-  if (!c) return `cours-${courseId}`;
-  return c.fullname || c.shortname || `cours-${courseId}`;
+  let c = r && r.courses && r.courses[0];
+  if (c) {
+    const n = cleanCourseTitle(c.displayname || c.fullname || c.shortname || "");
+    if (isUsableCourseName(n)) return n;
+  }
+
+  // Repli : certains sites restreignent get_courses_by_field.
+  r = await safe(() => wsCall(token, "core_course_get_courses", { options: { ids: [courseId] } }), null);
+  c = Array.isArray(r) ? r[0] : null;
+  if (c) {
+    const n = cleanCourseTitle(c.displayname || c.fullname || c.shortname || "");
+    if (isUsableCourseName(n)) return n;
+  }
+
+  return `cours-${courseId}`;
 }
 
 async function syncCourseWS(token, courseId, courseName) {
-  const name = courseName || (await courseNameWS(token, courseId));
-  const courseDir = ensureDir(fm.joinPath(ROOT, sanitize(`${courseId} - ${name}`, `cours-${courseId}`)));
+  let name = cleanCourseTitle(courseName || "");
+  if (!isUsableCourseName(name)) name = await courseNameWS(token, courseId);
+  const courseDir = resolveCourseDir(courseId, name);
   log(`\n📚 ${name}  (id ${courseId})`);
 
   const sections = await wsCall(token, "core_course_get_contents", { courseid: courseId });
@@ -966,14 +1103,8 @@ async function syncCourseHTML(client, courseId) {
     throw new Error(`Cours ${courseId} inaccessible (session perdue ou droits insuffisants).`);
   }
 
-  let name = "";
-  const t = /<title>([\s\S]*?)<\/title>/i.exec(html);
-  if (t) name = stripTags(t[1]).replace(/\s*[|:]\s*.*$/, "").trim();
-  const h1 = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
-  if (h1 && stripTags(h1[1])) name = stripTags(h1[1]);
-  if (!name) name = `cours-${courseId}`;
-
-  const courseDir = ensureDir(fm.joinPath(ROOT, sanitize(`${courseId} - ${name}`, `cours-${courseId}`)));
+  const name = courseNameFromHtml(html, courseId) || `cours-${courseId}`;
+  const courseDir = resolveCourseDir(courseId, name);
   log(`\n📚 ${name}  (id ${courseId})`);
 
   const sections = parseCourseHtml(html);
@@ -1272,7 +1403,10 @@ async function listMyCoursesWS(token, info) {
   const userid = info && info.userid ? info.userid : (await validateToken(token) || {}).userid;
   if (!userid) return [];
   const courses = await safe(() => wsCall(token, "core_enrol_get_users_courses", { userid }), []);
-  return (courses || []).map((c) => ({ id: c.id, name: c.fullname || c.shortname }));
+  return (courses || []).map((c) => ({
+    id: c.id,
+    name: cleanCourseTitle(c.displayname || c.fullname || c.shortname || ""),
+  }));
 }
 
 function summary(started) {
