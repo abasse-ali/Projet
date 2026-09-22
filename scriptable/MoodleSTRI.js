@@ -10,11 +10,11 @@
 //
 //  Site par défaut : https://www.stri.fr/eformation   (cours id=45)
 //
-//  3 modes de connexion, essayés dans cet ordre :
-//    1. "ws"  : jeton de service web Moodle (API REST) — le plus fiable
-//    2. "web" : identifiant + mot de passe sur /login/index.php (session)
-//    3. "wv"  : connexion dans une WebView (indispensable si SSO / CAS),
-//               les téléchargements passent ensuite par la session du WebView
+//  AUTHENTIFICATION — connexion dans le navigateur, uniquement.
+//  Tu te connectes dans la fenêtre qui s'ouvre (SSO / CAS compris), puis le
+//  script travaille avec cette session. Si Moodle expose un jeton de service
+//  web sur la page « Clés de sécurité », il est mémorisé et réutilisé aux
+//  lancements suivants : même authentification, sans avoir à se reconnecter.
 //
 //  STOCKAGE — à lire une fois
 //  FileManager.local().documentsDirectory() est un conteneur INTERNE que l'app
@@ -51,7 +51,8 @@ const CONFIG = {
   // --- Divers --------------------------------------------------------------
   notify: true,             // notification iOS à la fin
   verbose: true,
-  resetCredentials: false,  // true = oublie identifiants/jeton mémorisés puis redemande
+  reuseToken: true,         // true = réutilise le jeton mémorisé sans rouvrir le navigateur
+  resetAuth: false,         // true = oublie le jeton mémorisé et force une nouvelle connexion
 };
 
 // ---------------------------------------------------------------------------
@@ -63,11 +64,11 @@ const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 " +
   "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 
-const KC = {
-  token: "moodle_stri_token",
-  user: "moodle_stri_user",
-  pass: "moodle_stri_pass",
-};
+const KC = { token: "moodle_stri_token" };
+
+// Clés écrites par les versions précédentes : purgées au démarrage pour ne pas
+// laisser traîner un mot de passe dans le trousseau.
+const KC_LEGACY = ["moodle_stri_user", "moodle_stri_pass"];
 
 const stats = { files: 0, skipped: 0, links: 0, pages: 0, bytes: 0, errors: [] };
 
@@ -658,74 +659,10 @@ async function wsCall(token, wsfunction, params) {
   return j;
 }
 
-async function tokenFromCredentials(user, pass) {
-  const r = await http(`${BASE}/login/token.php`, {
-    as: "json",
-    form: { username: user, password: pass, service: "moodle_mobile_app" },
-  });
-  const j = r.payload || {};
-  if (j.token) return j.token;
-  // Le errorcode distingue « mauvais mot de passe » de « web services coupés ».
-  const err = new Error(j.error || j.errorcode || "login/token.php : réponse inattendue");
-  err.errorcode = j.errorcode || "";
-  throw err;
-}
-
-/** Essaie d'obtenir un jeton, en expliquant précisément tout échec. */
-async function tryToken(user, pass) {
-  try {
-    const t = await tokenFromCredentials(user, pass);
-    if (await validateToken(t)) return t;
-    warn("Jeton obtenu mais refusé par le site.");
-  } catch (e) {
-    const code = (e && e.errorcode) || "";
-    if (code === "invalidlogin") {
-      warn("token.php : identifiants refusés (invalidlogin).");
-    } else if (code) {
-      warn(`token.php indisponible (${code}) — ce n'est PAS un problème de mot de passe.`);
-    } else {
-      warn(`token.php : ${(e && e.message) || e}`);
-    }
-  }
-  return null;
-}
-
-/** Décode un lien « moodlemobile://token=... » copié après une connexion SSO. */
-function tokenFromLaunchUrl(raw) {
-  const m = /token=([A-Za-z0-9+/=%_-]+)/.exec(String(raw || ""));
-  if (!m) throw new Error("Lien invalide : paramètre token absent.");
-  let b64 = decodeURIComponent(m[1]).replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4) b64 += "=";
-  let decoded = "";
-  try { decoded = Data.fromBase64String(b64).toRawString(); } catch (e) { decoded = ""; }
-  const parts = String(decoded).split(":::");
-  const token = (parts.length > 1 ? parts[1] : parts[0] || "").trim();
-  if (!token) throw new Error("Impossible de décoder le jeton.");
-  return token;
-}
-
 async function validateToken(token) {
   if (!token) return null;
   const info = await safe(() => wsCall(token, "core_webservice_get_site_info", {}), null);
   return info && info.username ? info : null;
-}
-
-async function askCredentials(message) {
-  const a = new Alert();
-  a.title = "Identifiants Moodle";
-  a.message = message || `Connexion à ${ORIGIN}`;
-  a.addTextField("Identifiant", Keychain.contains(KC.user) ? Keychain.get(KC.user) : "");
-  a.addSecureTextField("Mot de passe", "");
-  a.addAction("Se connecter");
-  a.addCancelAction("Annuler");
-  const idx = await a.presentAlert();
-  if (idx === -1) return null;
-  const user = (a.textFieldValue(0) || "").trim();
-  const pass = a.textFieldValue(1) || "";
-  if (!user || !pass) return null;
-  Keychain.set(KC.user, user);
-  Keychain.set(KC.pass, pass);
-  return { user, pass };
 }
 
 /**
@@ -749,65 +686,6 @@ function isLoggedInHtml(html) {
 function looksLikeSso(finalUrl, html) {
   if (finalUrl && !isSameSite(finalUrl)) return true;
   return /name="execution"|\/cas\/login|shibboleth|SAMLRequest|\/idp\//i.test(String(html || ""));
-}
-
-/** Le message d'erreur réellement affiché par Moodle, ou "" s'il n'y en a pas. */
-function loginErrorFromHtml(html) {
-  const src = String(html || "");
-  let m = /id="loginerrormessage"[^>]*>([\s\S]*?)<\//i.exec(src);
-  if (!m) {
-    m = /<(?:div|span|p)[^>]+class="[^"]*\b(?:loginerrors|alert-danger)\b[^"]*"[^>]*>([\s\S]*?)<\/(?:div|span|p)>/i.exec(src);
-  }
-  const txt = m ? stripTags(m[1]) : "";
-  return txt.length > 2 ? txt : "";
-}
-
-/**
- * Connexion « classique » par formulaire (mode web, session par cookie).
- *
- * On ne devine JAMAIS l'échec en cherchant des mots-clés dans le HTML :
- * « loginerrors » existe comme conteneur vide sur beaucoup de thèmes, et une
- * page CAS contient les mots « identifiant » et « mot de passe ». On vérifie
- * le succès (session ouverte sur /my/), et on ne parle d'échec qu'ensuite,
- * en citant le message réel du serveur.
- */
-async function webLogin(user, pass) {
-  const page = await http(`${BASE}/login/index.php`, { as: "string" });
-  const html = String(page.payload || "");
-
-  if (looksLikeSso(page.finalUrl, html)) {
-    throw new Error(
-      "Ce Moodle passe par un portail SSO / CAS : le formulaire identifiant + " +
-      "mot de passe ne peut pas fonctionner ici. Utilise « Connexion navigateur (SSO / CAS) »."
-    );
-  }
-
-  const m = /name="logintoken"\s+value="([^"]+)"/i.exec(html) ||
-            /value="([^"]+)"\s+name="logintoken"/i.exec(html);
-  const form = { username: user, password: pass, anchor: "" };
-  if (m) form.logintoken = m[1];
-
-  const res = await http(`${BASE}/login/index.php`, {
-    as: "string",
-    form,
-    headers: { Referer: `${BASE}/login/index.php` },
-  });
-
-  const check = await http(`${BASE}/my/`, { as: "string" });
-  if (isLoggedInHtml(String(check.payload || ""))) return true;
-
-  const reason = loginErrorFromHtml(String(res.payload || ""));
-  if (reason) throw new Error(`Moodle a refusé la connexion : ${reason}`);
-  if (!m) {
-    throw new Error(
-      "Aucun logintoken sur la page de connexion : ce site n'utilise pas le " +
-      "formulaire Moodle standard. Utilise « Connexion navigateur (SSO / CAS) »."
-    );
-  }
-  throw new Error(
-    "Connexion non confirmée par le site (ni message d'erreur, ni session ouverte). " +
-    "Essaie « Connexion navigateur (SSO / CAS) »."
-  );
 }
 
 /** Connexion dans une WebView : seule solution fiable avec un SSO/CAS. */
@@ -1399,12 +1277,20 @@ function finishCourse(courseDir, name, links, index) {
 // ---------------------------------------------------------------------------
 //  Orchestration
 // ---------------------------------------------------------------------------
-function forgetCredentials() {
-  for (const k of Object.keys(KC)) {
-    const key = KC[k];
-    if (Keychain.contains(key)) Keychain.remove(key);
+/** Oublie le jeton mémorisé : la prochaine connexion repassera par le navigateur. */
+function forgetAuth() {
+  if (Keychain.contains(KC.token)) Keychain.remove(KC.token);
+  log("Jeton oublié.");
+}
+
+/** Supprime les identifiants stockés par les anciennes versions du script. */
+function purgeLegacyCredentials() {
+  for (const k of KC_LEGACY) {
+    if (Keychain.contains(k)) {
+      Keychain.remove(k);
+      log(`Ancien identifiant « ${k} » supprimé du trousseau.`);
+    }
   }
-  log("Identifiants et jeton oubliés.");
 }
 
 function resolveCourseIds() {
@@ -1434,112 +1320,33 @@ async function connectViaWebView() {
   return { mode: "wv", token: null, client: WebViewClient, wv };
 }
 
-/** Jeton collé depuis le lien moodlemobile:// obtenu après une connexion SSO. */
-async function connectViaPastedLink() {
-  const a = new Alert();
-  a.title = "Lien moodlemobile://";
-  a.message =
-    "1) Ouvre dans Safari :\n" +
-    `${BASE}/admin/tool/mobile/launch.php?service=moodle_mobile_app&passport=1&urlscheme=moodlemobile\n` +
-    "2) Connecte-toi (SSO compris)\n" +
-    "3) Copie le lien « moodlemobile://token=... » et colle-le ici.";
-  a.addTextField("moodlemobile://token=…", Pasteboard.paste() || "");
-  a.addAction("Valider");
-  a.addCancelAction("Annuler");
-  const r = await a.presentAlert();
-  if (r === -1) throw new Error("Connexion annulée.");
-  const t = tokenFromLaunchUrl(a.textFieldValue(0));
-  if (!(await validateToken(t))) throw new Error("Jeton refusé par le site.");
-  Keychain.set(KC.token, t);
-  log("✓ Jeton SSO validé.");
-  return { mode: "ws", token: t, client: NetClient };
-}
-
-/** Choisit et établit le mode de connexion. Retourne {mode, token, client}. */
+/**
+ * Authentification : connexion dans le navigateur, et rien d'autre.
+ *
+ * Un jeton de service web récupéré lors d'une connexion précédente est réutilisé
+ * s'il est encore valable — c'est la même authentification, simplement mémorisée.
+ * Mets CONFIG.reuseToken à false pour repasser par le navigateur à chaque fois.
+ */
 async function connect() {
-  // a) jeton déjà mémorisé
-  let token = Keychain.contains(KC.token) ? Keychain.get(KC.token) : null;
-  if (token) {
+  if (CONFIG.reuseToken && Keychain.contains(KC.token)) {
+    const token = Keychain.get(KC.token);
     const info = await validateToken(token);
     if (info) {
-      log(`✓ Service web : connecté en tant que ${info.username} (${info.sitename || ORIGIN})`);
+      log(`✓ Jeton mémorisé valide — connecté en tant que ${info.username}.`);
       return { mode: "ws", token, client: NetClient, info };
     }
     Keychain.remove(KC.token);
-    warn("Jeton mémorisé expiré.");
-  }
-
-  // b) identifiants mémorisés
-  if (Keychain.contains(KC.user) && Keychain.contains(KC.pass)) {
-    const user = Keychain.get(KC.user);
-    const pass = Keychain.get(KC.pass);
-
-    const t = await tryToken(user, pass);
-    if (t) {
-      Keychain.set(KC.token, t);
-      log("✓ Service web : jeton obtenu avec les identifiants mémorisés.");
-      return { mode: "ws", token: t, client: NetClient };
-    }
-    const ok = await safe(() => webLogin(user, pass), false);
-    if (ok) {
-      log("✓ Session web ouverte avec les identifiants mémorisés.");
-      return { mode: "web", token: null, client: NetClient };
-    }
-    // Inutile de les retenter à chaque lancement : on les oublie.
-    Keychain.remove(KC.pass);
-    warn("Les identifiants mémorisés ne fonctionnent plus — ils sont oubliés.");
+    warn("Jeton mémorisé expiré — reconnexion dans le navigateur.");
   }
 
   if (!config.runsInApp) {
     throw new Error(
-      "Aucune connexion valide mémorisée. Lance le script une fois depuis l'app Scriptable pour t'authentifier."
+      "La connexion navigateur demande une interaction : lance le script depuis " +
+      "l'app Scriptable pour t'authentifier, puis le jeton mémorisé prendra le relais."
     );
   }
 
-  // c) choix interactif
-  const menu = new Alert();
-  menu.title = "Connexion à Moodle STRI";
-  menu.message = "Comment veux-tu te connecter ?";
-  menu.addAction("Identifiant + mot de passe");
-  menu.addAction("Connexion navigateur (SSO / CAS)");
-  menu.addAction("Coller un lien moodlemobile://");
-  menu.addCancelAction("Annuler");
-  const choice = await menu.presentAlert();
-  if (choice === -1) throw new Error("Connexion annulée.");
-
-  if (choice === 1) return await connectViaWebView();
-  if (choice === 2) return await connectViaPastedLink();
-
-  // choice === 0 : identifiant + mot de passe
-  const creds = await askCredentials();
-  if (!creds) throw new Error("Connexion annulée.");
-
-  const t = await tryToken(creds.user, creds.pass);
-  if (t) {
-    Keychain.set(KC.token, t);
-    log("✓ Service web : jeton obtenu.");
-    return { mode: "ws", token: t, client: NetClient };
-  }
-
-  warn("Service web indisponible — tentative de session web classique.");
-  try {
-    await webLogin(creds.user, creds.pass);
-    log("✓ Session web ouverte.");
-    return { mode: "web", token: null, client: NetClient };
-  } catch (e) {
-    Keychain.remove(KC.pass);
-    const why = (e && e.message) ? e.message : String(e);
-    const ask = new Alert();
-    ask.title = "Connexion directe impossible";
-    ask.message = why + "\n\nVeux-tu passer par le navigateur maintenant ?";
-    ask.addAction("Connexion navigateur (SSO / CAS)");
-    ask.addAction("Coller un lien moodlemobile://");
-    ask.addCancelAction("Abandonner");
-    const next = await ask.presentAlert();
-    if (next === 0) return await connectViaWebView();
-    if (next === 1) return await connectViaPastedLink();
-    throw e;
-  }
+  return await connectViaWebView();
 }
 
 async function listMyCoursesWS(token, info) {
@@ -1575,7 +1382,8 @@ function summary(started) {
 
 async function main() {
   const started = Date.now();
-  if (CONFIG.resetCredentials) forgetCredentials();
+  purgeLegacyCredentials();
+  if (CONFIG.resetAuth) forgetAuth();
 
   ensureDir(ROOT);
   log(`Destination : ${ROOT}`);
