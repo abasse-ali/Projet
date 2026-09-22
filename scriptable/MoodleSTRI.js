@@ -1160,10 +1160,41 @@ async function syncCourseWS(token, courseId, courseName) {
 //  Synchronisation — mode HTML (session web ou WebView)
 // ---------------------------------------------------------------------------
 async function syncCourseHTML(client, courseId) {
-  const res = await client.fetch(`${BASE}/course/view.php?id=${courseId}`);
-  const html = String(res.text || "");
-  if (!html || (/login\/index\.php/i.test(html) && /loginform|loginbtn/i.test(html))) {
-    throw new Error(`Cours ${courseId} inaccessible (session perdue ou droits insuffisants).`);
+  const url = `${BASE}/course/view.php?id=${courseId}`;
+  const res = await client.fetch(url);
+
+  // La réponse peut arriver en binaire si le serveur annonce mal son type :
+  // on récupère quand même le texte au lieu de conclure à une session perdue.
+  let html = String(res.text || "");
+  if (!html && res.data) {
+    try { html = res.data.toRawString(); } catch (e) { html = ""; }
+  }
+
+  if (!html) {
+    throw new Error(
+      `Cours ${courseId} : réponse vide — HTTP ${res.status || "?"}, ` +
+      `type « ${res.contentType || "inconnu"} », URL finale ${res.finalUrl || url}.`
+    );
+  }
+
+  // Preuve POSITIVE d'une session ouverte, plutôt que des mots-clés de login
+  // qui sont présents un peu partout dans le HTML de Moodle.
+  const loggedIn = /"sesskey"\s*:\s*"|\/login\/logout\.php/i.test(html);
+  if (!loggedIn) {
+    const t = /<title>([\s\S]*?)<\/title>/i.exec(html);
+    const titre = stripTags(t ? t[1] : "") || "sans titre";
+    const cause = looksLikeSso(res.finalUrl, html)
+      ? "redirection vers le portail SSO"
+      : "page de connexion Moodle";
+    throw new Error(
+      `Cours ${courseId} : session non reconnue (${cause}). ` +
+      `Page reçue : « ${titre} » — HTTP ${res.status || "?"}, URL ${res.finalUrl || url}.`
+    );
+  }
+
+  // Connecté, mais pas inscrit à ce cours.
+  if (/\/enrol\/index\.php/i.test(String(res.finalUrl || "")) || /id="page-enrol-index"/i.test(html)) {
+    throw new Error(`Cours ${courseId} : inscription requise — ce compte n'y est pas inscrit.`);
   }
 
   const name = courseNameFromHtml(html, courseId) || `cours-${courseId}`;
