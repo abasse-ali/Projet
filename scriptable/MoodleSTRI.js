@@ -29,6 +29,9 @@ const CONFIG = {
   // --- Site et cours -------------------------------------------------------
   baseUrl: "https://www.stri.fr/eformation",
   courseIds: [45],          // ex. [45, 52, 61]
+  courseNames: {            // nom impose par cours : prioritaire sur la detection
+    45: "Bases de données - Oracle",
+  },
   allMyCourses: false,      // true = tous les cours où je suis inscrit (mode ws)
 
   // --- Stockage ------------------------------------------------------------
@@ -842,8 +845,19 @@ function parseCourseHtml(html) {
 // ---------------------------------------------------------------------------
 
 /** En-têtes de page qui ne sont PAS le nom d'un cours. */
-const GENERIC_TITLES =
-  /^(cours|course|kurs|curso|accueil|home|tableau de bord|dashboard|mes cours|my courses|moodle|navigation|menu|contenu|content|section \d+)$/i;
+const GENERIC_TITLES = new RegExp(
+  "^(" +
+  // Pages et sections génériques
+  "cours|course|kurs|curso|accueil|home|tableau de bord|dashboard|mes cours|my courses|" +
+  "moodle|navigation|menu|contenu|content|section \\\\d+|site|espace personnel|" +
+  // Libellés de la barre Moodle — « Langue » a déjà nommé un dossier par erreur
+  "langue|language|français|francais|english|recherche|search|rechercher|" +
+  "notifications|messages|profil|profile|préférences|preferences|utilisateur|user|" +
+  "déconnexion|deconnexion|connexion|se connecter|log ?in|log ?out|aide|help|" +
+  "calendrier|calendar|fichiers personnels|mes fichiers|participants|badges|" +
+  "notes|grades|rapports|reports|compétences|competences|basculer|toggle" +
+  ")$", "i"
+);
 
 function isUsableCourseName(s) {
   const n = String(s == null ? "" : s).trim();
@@ -872,40 +886,53 @@ function courseNameFromHtml(html, courseId) {
   // Ceinture et bretelles : une page de connexion ne nomme jamais un cours.
   if (/id="page-login-index"|\bnotloggedin\b/i.test(src)) return "";
   const id = String(courseId);
+
+  // Lien EXACT vers ce cours : « ?id=45 » et rien d'autre derrière.
+  // Sans cette exigence on attrape les liens du sélecteur de langue
+  // (…/course/view.php?id=45&lang=fr) et le dossier finit nommé « Langue ».
+  const exact = '<a[^>]+href="[^"]*\\/course\\/view\\.php\\?id=' + id + '(?:#[^"]*)?"';
+
   const candidates = [];
+  let m;
 
-  // 1. En-tête de page des thèmes Boost / Classic : le nom exact du cours.
-  let m = /<div[^>]+class="[^"]*page-header-headings[^"]*"[^>]*>\s*<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(src);
-  if (m) candidates.push(m[1]);
+  // 1. En-tête de page des thèmes Boost / Classic : la source la plus sûre.
+  m = /<div[^>]+class="[^"]*page-header-headings[^"]*"[^>]*>\s*<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(src);
+  if (m) candidates.push(["en-tête de page", m[1]]);
 
-  // 2. Fil d'Ariane : l'attribut title du lien du cours porte le nom complet.
-  m = new RegExp(
-    '<a[^>]+href="[^"]*\\/course\\/view\\.php\\?id=' + id + '(?:[^0-9][^"]*)?"[^>]*title="([^"]+)"',
-    "i"
-  ).exec(src);
-  if (m) candidates.push(decodeEntities(m[1]));
-
-  // 3. Texte de ce même lien.
-  m = new RegExp(
-    '<a[^>]+href="[^"]*\\/course\\/view\\.php\\?id=' + id + '(?:[^0-9][^"]*)?"[^>]*>([\\s\\S]*?)<\\/a>',
-    "i"
-  ).exec(src);
-  if (m) candidates.push(m[1]);
-
-  // 4. <title> de la page.
+  // 2. <title> : « Cours : <nom> | <site> ». Fiable sur tous les thèmes.
   m = /<title>([\s\S]*?)<\/title>/i.exec(src);
-  if (m) candidates.push(m[1]);
+  if (m) candidates.push(["<title>", m[1]]);
+
+  // 3. Attribut title du lien exact (fil d'Ariane).
+  m = new RegExp(exact + '[^>]*title="([^"]+)"', "i").exec(src);
+  if (m) candidates.push(["fil d'Ariane (title)", decodeEntities(m[1])]);
+
+  // 4. Texte de ce même lien exact.
+  m = new RegExp(exact + '[^>]*>([\\s\\S]*?)<\\/a>', "i").exec(src);
+  if (m) candidates.push(["fil d'Ariane (texte)", m[1]]);
 
   // 5. En dernier recours, le premier <h1> non générique.
   const h1Re = /<h1[^>]*>([\s\S]*?)<\/h1>/gi;
   let h;
-  while ((h = h1Re.exec(src))) candidates.push(h[1]);
+  while ((h = h1Re.exec(src))) candidates.push(["<h1>", h[1]]);
 
   for (const c of candidates) {
-    const n = cleanCourseTitle(c);
-    if (isUsableCourseName(n)) return n;
+    const n = cleanCourseTitle(c[1]);
+    if (isUsableCourseName(n)) {
+      log(`  · nom du cours via ${c[0]} : « ${n} »`);
+      return n;
+    }
   }
+  warn(`  · aucun nom exploitable dans la page du cours ${id}.`);
   return "";
+}
+
+/** Nom imposé dans CONFIG.courseNames, prioritaire sur toute détection. */
+function configuredCourseName(courseId) {
+  const map = CONFIG.courseNames || {};
+  const raw = map[courseId] != null ? map[courseId] : map[String(courseId)];
+  const n = cleanCourseTitle(raw || "");
+  return isUsableCourseName(n) ? n : "";
 }
 
 /** Nom de dossier pour un cours, selon CONFIG.includeCourseId. */
@@ -988,7 +1015,7 @@ async function courseNameWS(token, courseId) {
 }
 
 async function syncCourseWS(token, courseId, courseName) {
-  let name = cleanCourseTitle(courseName || "");
+  let name = configuredCourseName(courseId) || cleanCourseTitle(courseName || "");
   if (!isUsableCourseName(name)) name = await courseNameWS(token, courseId);
   const courseDir = resolveCourseDir(courseId, name);
   log(`\n📚 ${name}  (id ${courseId})`);
@@ -1099,7 +1126,10 @@ async function syncCourseHTML(client, courseId) {
     throw new Error(`Cours ${courseId} : inscription requise — ce compte n'y est pas inscrit.`);
   }
 
-  const name = courseNameFromHtml(html, courseId) || `cours-${courseId}`;
+  const name =
+    configuredCourseName(courseId) ||
+    courseNameFromHtml(html, courseId) ||
+    `cours-${courseId}`;
   const courseDir = resolveCourseDir(courseId, name);
   log(`\n📚 ${name}  (id ${courseId})`);
 
